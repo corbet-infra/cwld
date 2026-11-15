@@ -1786,6 +1786,7 @@ fn a_ci_job_requires_a_ci_instance() {
             program: "true".to_owned(),
             args: Vec::new(),
             timeout: std::time::Duration::from_secs(1),
+            stdin: None,
         },
     };
     let mut log = event_log();
