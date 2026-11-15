@@ -1303,3 +1303,19 @@ slots = [{ id = "0", name = "srv-0" }, { id = "1", name = "srv-1" }]
         "unknown keys are refused"
     );
 }
+
+#[test]
+fn a_line_break_in_a_header_is_refused_before_curl_runs() {
+    let err = CurlHttp {
+        curl: "/nonexistent/curl".to_owned(),
+        timeout_s: 1,
+    }
+    .send(&HttpRequest {
+        method: "GET".to_owned(),
+        url: "http://127.0.0.1:1/".to_owned(),
+        headers: vec![("X-A".to_owned(), "v\r\nX-Injected: 1".to_owned())],
+        body: None,
+    })
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}

@@ -71,7 +71,13 @@ fn ci_check(path: &Path) -> ExitCode {
     match cwld::dispatch::config::CiConfig::load(path) {
         Ok(cfg) => {
             for pool in &cfg.pools {
-                println!("pool {} ({}): {} slot(s), {} MiB per job", pool.label, pool.kind, pool.slots.len(), pool.claim_mib);
+                println!(
+                    "pool {} ({}): {} slot(s), {} MiB per job",
+                    pool.label,
+                    pool.kind,
+                    pool.slots.len(),
+                    pool.claim_mib
+                );
             }
             ExitCode::SUCCESS
         }
@@ -88,8 +94,12 @@ fn ci_serve(path: &Path) -> ExitCode {
     let run = || -> Result<(), String> {
         let cfg = CiConfig::load(path).map_err(|e| e.to_string())?;
         let creds = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
-        let token = read_credential(creds.as_deref(), &cfg.forge.credential).map_err(|e| e.to_string())?;
-        let admission = std::sync::Arc::new(ConductorAdmission::new(cdct::Conductor::with_defaults(), system_snapshot));
+        let token =
+            read_credential(creds.as_deref(), &cfg.forge.credential).map_err(|e| e.to_string())?;
+        let admission = std::sync::Arc::new(ConductorAdmission::new(
+            cdct::Conductor::with_defaults(),
+            system_snapshot,
+        ));
         let dispatcher = std::sync::Arc::new(
             build(&cfg, token, admission, |line| println!("{line}")).map_err(|e| e.to_string())?,
         );

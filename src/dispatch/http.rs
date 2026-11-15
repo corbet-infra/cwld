@@ -111,6 +111,21 @@ fn curl_config(request: &HttpRequest) -> String {
 
 impl Http for CurlHttp {
     fn send(&self, request: &HttpRequest) -> io::Result<HttpResponse> {
+        // curl's config syntax turns `\n` into a real newline, so a line break in
+        // a header would inject another header: refuse it outright.
+        let bad = |text: &str| text.contains(['\r', '\n']);
+        if request
+            .headers
+            .iter()
+            .any(|(name, value)| bad(name) || bad(value))
+            || bad(&request.url)
+            || bad(&request.method)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a line break in a request line or header is refused",
+            ));
+        }
         let mut child = Command::new(&self.curl)
             .args([
                 "--silent",
