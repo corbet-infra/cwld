@@ -1674,6 +1674,7 @@ fn a_ci_job_runs_clean_start_exec_stop_and_reset() {
             program: "build.sh".to_owned(),
             args: vec!["--check".to_owned()],
             timeout: std::time::Duration::from_secs(60),
+            stdin: None,
         },
     };
     let mut log = event_log();
@@ -1715,6 +1716,7 @@ fn a_stopped_ephemeral_instance_is_reset_before_it_starts() {
             program: "build.sh".to_owned(),
             args: Vec::new(),
             timeout: std::time::Duration::from_secs(60),
+            stdin: None,
         },
     };
     let mut log = event_log();
@@ -1887,6 +1889,7 @@ fn a_dirty_ephemeral_instance_is_reset_before_the_next_start() {
             program: "build.sh".to_owned(),
             args: Vec::new(),
             timeout: std::time::Duration::from_secs(60),
+            stdin: None,
         },
     };
     let report = runtime
