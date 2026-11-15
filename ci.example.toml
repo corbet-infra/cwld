@@ -1,7 +1,8 @@
 # cwld ci serve --config ci.example.toml   (the deployment, nixci, writes the real file)
 # The read-scope forge credential is NOT here: it is the systemd credential `mint`
 # (CREDENTIALS_DIRECTORY/mint) of the unit that runs `cwld ci serve`.
-state_dir = "/var/lib/cwld-ci"
+state_dir = "/var/lib/cwld-ci"      # the dispatcher's own: per job the configuration and the credential file
+state_directory = "forgejo-runner"  # below /var/lib: the runner account's state; jobs (slots/<slot>/job.<h>) and the cache (cache/<slot>) are the job unit's own StateDirectory=
 
 [forge]
 api = "https://forge.example/api/v1"
@@ -19,7 +20,7 @@ claim_mib = 2048
 pickup_s = 20
 runner = "/run/current-system/sw/bin/forgejo-runner"
 template = "/etc/cwld-ci/runner.json"
-run_as = "forgejo-runner"      # User= of every job unit; the job directories are handed to it
+run_as = "forgejo-runner"      # User= of every job unit (required); the unit removes its own tree (ExecStopPost=)
 properties = ["Delegate=yes", "ProtectProc=invisible", "MemoryMax=infinity"]
 # the job's environment, one declaration for every slot; {credentials} is the job unit's own credentials directory
 environment = { HOME = "/var/lib/forgejo-runner", AWS_SHARED_CREDENTIALS_FILE = "{credentials}/sccache-aws" }

@@ -59,10 +59,10 @@ pub trait UnitRunner: Send + Sync {
     /// # Errors
     /// The unit could not be started.
     fn start(&self, spec: &UnitSpec) -> io::Result<Box<dyn RunningUnit>>;
-    /// End every process of the unit at once (`cgroup.kill`).
+    /// End every process of the unit at once (SIGKILL to the whole cgroup).
     ///
     /// # Errors
-    /// The kill file could not be written (a unit that is gone is no error).
+    /// The kill failed (a unit that is gone is no error).
     fn kill_all(&self, unit: &str) -> io::Result<()>;
     /// Whether the unit and its cgroup are gone.
     fn gone(&self, unit: &str) -> bool;
@@ -74,17 +74,21 @@ pub trait UnitRunner: Send + Sync {
     fn sweep(&self, prefix: &str) -> io::Result<Vec<String>>;
 }
 
-/// Units through `systemd-run` (interim adapter).
+/// Units through `systemd-run` and `systemctl` (interim adapter).
 ///
 /// The adopted-software table names `zbus` for systemd; this adapter shells to
 /// `systemd-run --pipe --wait` because that is the one call that streams the
 /// unit's output back, and it sits behind [`UnitRunner`] so the swap is one
-/// file. The kill never goes through `systemctl`: it writes the unit's
-/// `cgroup.kill` directly.
+/// file. The kill is `systemctl kill --kill-whom=all
+/// --signal=SIGKILL`, so the dispatcher needs no privilege beyond the polkit
+/// rule that lets its account manage `cwld-ci-*` units; systemd ends the
+/// whole cgroup.
 #[derive(Debug, Clone)]
 pub struct SystemdRun {
     /// The `systemd-run` binary.
     pub systemd_run: String,
+    /// The `systemctl` binary.
+    pub systemctl: String,
     /// The cgroup v2 mount (`/sys/fs/cgroup`).
     pub cgroup_root: PathBuf,
     /// The slice transient system units live in.
@@ -95,6 +99,7 @@ impl Default for SystemdRun {
     fn default() -> Self {
         Self {
             systemd_run: "systemd-run".to_owned(),
+            systemctl: "systemctl".to_owned(),
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             slice: "system.slice".to_owned(),
         }
@@ -157,6 +162,7 @@ impl UnitRunner for SystemdRun {
     fn start(&self, spec: &UnitSpec) -> io::Result<Box<dyn RunningUnit>> {
         let mut cmd = Command::new(&self.systemd_run);
         cmd.arg(format!("--unit={}", spec.unit))
+            .args(["--system", "--no-ask-password"])
             .args(["--collect", "--pipe", "--wait", "--quiet"])
             .arg(format!("--working-directory={}", spec.workdir.display()));
         for property in &spec.properties {
@@ -183,10 +189,23 @@ impl UnitRunner for SystemdRun {
     }
 
     fn kill_all(&self, unit: &str) -> io::Result<()> {
-        let file = self.cgroup(unit).join("cgroup.kill");
-        match std::fs::write(&file, b"1") {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            other => other,
+        if self.gone(unit) {
+            return Ok(());
+        }
+        let out = Command::new(&self.systemctl)
+            .args(["--system", "--no-ask-password", "kill", "--kill-whom=all"])
+            .arg("--signal=SIGKILL")
+            .arg(format!("{unit}.service"))
+            .stdin(Stdio::null())
+            .output()?;
+        // a unit that vanished between the check and the call is not an error
+        if out.status.success() || self.gone(unit) {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "systemctl kill {unit}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
         }
     }
 

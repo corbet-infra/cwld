@@ -50,6 +50,12 @@ enum CiCommand {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Remove one finished job's runner-owned directory (run by the job
+    /// unit's `ExecStopPost=` as the runner account).
+    Scrub {
+        /// A `job.<handle>` directory.
+        path: PathBuf,
+    },
     /// Validate a configuration file and print what it would serve.
     Check {
         /// The dispatcher configuration (TOML).
@@ -64,6 +70,26 @@ fn main() -> ExitCode {
         Command::RunPlan { plan, dry_run } => run_plan(&plan, dry_run),
         Command::Ci(CiCommand::Check { config }) => ci_check(&config),
         Command::Ci(CiCommand::Serve { config }) => ci_serve(&config),
+        Command::Ci(CiCommand::Scrub { path }) => ci_scrub(&path),
+    }
+}
+
+fn ci_scrub(path: &Path) -> ExitCode {
+    // only a job directory, never anything else a bad argument could name
+    let ok = path.is_absolute()
+        && path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("job."));
+    if !ok {
+        eprintln!("cwld: {} is not a job directory", path.display());
+        return ExitCode::FAILURE;
+    }
+    match cwld::dispatch::exec::scrub(path) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("cwld: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

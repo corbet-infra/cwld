@@ -174,6 +174,7 @@ struct UnitState {
     kill_flag: bool,
     release_flag: bool,
     gone_calls: usize,
+    workdirs: Vec<PathBuf>,
 }
 
 struct FakeUnits {
@@ -259,6 +260,7 @@ impl UnitRunner for FakeUnits {
             st.config_seen.push(std::fs::read_to_string(c)?);
         }
         st.started.push(spec.clone());
+        st.workdirs.push(spec.workdir.clone());
         st.kill_flag = false;
         st.release_flag = false;
         drop(st);
@@ -280,7 +282,14 @@ impl UnitRunner for FakeUnits {
     fn gone(&self, _unit: &str) -> bool {
         let mut st = lock(&self.state);
         st.gone_calls += 1;
-        st.gone_calls > self.stubborn
+        let gone = st.gone_calls > self.stubborn;
+        if gone {
+            // the unit's ExecStopPost removes the runner's tree
+            for dir in &st.workdirs {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        gone
     }
     fn sweep(&self, _prefix: &str) -> std::io::Result<Vec<String>> {
         Ok(Vec::new())
@@ -292,7 +301,9 @@ fn settings(dir: &std::path::Path, pickup_ms: u64) -> HostSettings {
         runner: PathBuf::from("/usr/bin/forgejo-runner"),
         template: serde_json::json!({"server": {}, "host": {}, "cache": {}}),
         state_dir: dir.to_path_buf(),
-        cache_dir: dir.join("cache"),
+        state_root: dir.join("var-lib"),
+        state_directory: "runner".to_owned(),
+        scrub_bin: PathBuf::from("/usr/bin/cwld"),
         pickup: Duration::from_millis(pickup_ms),
         properties: vec!["Delegate=yes".to_owned(), "User=jobs".to_owned()],
         environment: vec![
@@ -304,7 +315,6 @@ fn settings(dir: &std::path::Path, pickup_ms: u64) -> HostSettings {
             ("SCCACHE_SERVER_PORT".to_owned(), "1".to_owned()),
         ],
         slot_environment: vec![("SCCACHE_SERVER_PORT".to_owned(), "4230".to_owned())],
-        owner: None,
         credentials_root: PathBuf::from("/run/credentials"),
         kill_rounds: 5,
         kill_pause: Duration::from_millis(1),
@@ -456,6 +466,17 @@ fn a_job_runs_in_a_fresh_unit_and_leaves_nothing() {
         3,
         "an override replaces, it does not repeat"
     );
+    // the runner's tree is the unit's own state directory, removed by the unit as its account
+    let has = |p: String| spec.properties.contains(&p);
+    assert!(has(format!(
+        "StateDirectory=runner/slots/0/job.{HANDLE_A} runner/cache/0"
+    )));
+    assert!(has(format!(
+        "ExecStopPost=/usr/bin/cwld ci scrub {}",
+        rig.dir
+            .join(format!("var-lib/runner/slots/0/job.{HANDLE_A}"))
+            .display()
+    )));
     // the single-use token is a 0600 credential file, in no argument and no log line
     assert_eq!(
         st.token_seen,
@@ -465,7 +486,7 @@ fn a_job_runs_in_a_fresh_unit_and_leaves_nothing() {
     assert!(!rig.secrets_leaked());
     assert!(
         !rig.dir
-            .join("slots/0")
+            .join("var-lib/runner/slots/0")
             .join(format!("job.{HANDLE_A}"))
             .exists(),
         "the job directory is gone"
@@ -1310,6 +1331,7 @@ kind = "host"
 claim_mib = 2048
 runner = "/bin/forgejo-runner"
 template = "/etc/runner.json"
+run_as = "forgejo-runner"
 slots = [{ id = "0", name = "srv-0" }, { id = "1", name = "srv-1" }]
 "#;
     let cfg = CiConfig::parse(ok).expect("valid");
@@ -1389,8 +1411,9 @@ fn output_that_is_not_utf8_neither_ends_the_stream_nor_hides_the_cancel_line() {
 }
 
 #[test]
-fn a_sweep_ends_the_leftover_units_of_a_dead_predecessor_only() {
+fn a_sweep_and_a_kill_go_through_systemctl_for_cwld_ci_units_only() {
     use cwld::dispatch::units::SystemdRun;
+    use std::os::unix::fs::PermissionsExt;
     let root = temp("cgroups");
     let slice = root.join("system.slice");
     for name in [
@@ -1399,36 +1422,36 @@ fn a_sweep_ends_the_leftover_units_of_a_dead_predecessor_only() {
         "sshd.service",
     ] {
         std::fs::create_dir_all(slice.join(name)).expect("cgroup");
-        std::fs::write(slice.join(name).join("cgroup.kill"), "").expect("kill file");
     }
+    let calls = root.join("calls");
+    let script = root.join("systemctl");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho \"$@\" >> {}\n", calls.display()),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let runner = SystemdRun {
+        systemctl: script.display().to_string(),
         cgroup_root: root,
         ..SystemdRun::default()
     };
     let swept = runner.sweep("cwld-ci-").expect("sweep");
     assert_eq!(swept, ["cwld-ci-0-aaaa", "cwld-ci-1-bbbb"]);
-    assert_eq!(
-        std::fs::read_to_string(slice.join("cwld-ci-0-aaaa.service/cgroup.kill")).unwrap(),
-        "1"
+    let log = std::fs::read_to_string(&calls).expect("calls");
+    assert_eq!(log.lines().count(), 2, "{log}");
+    assert!(
+        log.contains("kill --kill-whom=all --signal=SIGKILL cwld-ci-0-aaaa.service"),
+        "{log}"
     );
-    assert_eq!(
-        std::fs::read_to_string(slice.join("sshd.service/cgroup.kill")).unwrap(),
-        ""
-    );
+    assert!(!log.contains("sshd"));
+    // a unit that is already gone costs no call
+    runner.kill_all("cwld-ci-9-gone").expect("gone is fine");
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
 }
 
 #[test]
-fn the_runner_account_is_read_from_passwd_and_a_double_user_is_refused() {
-    use cwld::dispatch::config::account_ids;
-    let dir = temp("passwd");
-    let passwd = dir.join("passwd");
-    std::fs::write(
-        &passwd,
-        "root:x:0:0::/root:/bin/sh\nforgejo-runner:x:995:994::/var/lib/forgejo-runner:/bin/false\n",
-    )
-    .unwrap();
-    assert_eq!(account_ids(&passwd, "forgejo-runner").unwrap(), (995, 994));
-    assert!(account_ids(&passwd, "nobody-here").is_err());
+fn a_host_pool_names_its_account_and_the_state_directory_stays_relative() {
     let base = r#"
 state_dir = "/var/lib/cwld-ci"
 [forge]
@@ -1447,6 +1470,11 @@ slots = [{ id = "0", name = "srv-0", environment = { SCCACHE_SERVER_PORT = "4230
 "#;
     assert!(CiConfig::parse(base).is_ok());
     assert!(
+        CiConfig::parse(&base.replace("run_as = \"forgejo-runner\"\n", "")).is_err(),
+        "a host pool without an account would run its jobs as root"
+    );
+    assert!(CiConfig::parse(&format!("state_directory = \"../etc\"\n{base}")).is_err());
+    assert!(
         CiConfig::parse(&base.replace(
             "run_as = \"forgejo-runner\"",
             "run_as = \"forgejo-runner\"\nproperties = [\"User=x\"]"
@@ -1454,4 +1482,24 @@ slots = [{ id = "0", name = "srv-0", environment = { SCCACHE_SERVER_PORT = "4230
         .is_err()
     );
     assert!(CiConfig::parse(&base.replace("HOME =", "\"1BAD\" =")).is_err());
+}
+
+#[test]
+fn the_scrub_command_removes_job_directories_and_nothing_else() {
+    let dir = temp("scrub-cmd");
+    let job = dir.join("job.abc");
+    std::fs::create_dir_all(job.join("work/deep")).unwrap();
+    std::fs::write(job.join("work/deep/f"), "x").unwrap();
+    let bin = env!("CARGO_BIN_EXE_cwld");
+    let run = |p: &std::path::Path| {
+        std::process::Command::new(bin)
+            .args(["ci", "scrub"])
+            .arg(p)
+            .status()
+            .unwrap()
+    };
+    assert!(!run(&dir).success(), "not a job directory");
+    assert!(dir.exists());
+    assert!(run(&job).success());
+    assert!(!job.exists());
 }

@@ -132,9 +132,8 @@ pub struct PoolSection {
     #[serde(default)]
     pub properties: Vec<String>,
     /// Host pools: the account the runner process runs as. The dispatcher
-    /// starts the unit with `User=` this name and hands the job directories to
-    /// it (the dispatcher runs as root: starting a system unit, writing its
-    /// `cgroup.kill` and removing a job's tree need it).
+    /// starts the unit with `User=` this name; a host pool must name one (a
+    /// transient unit would otherwise run as root).
     pub run_as: Option<String>,
     /// Host pools: the job environment. A value may hold `{unit}`, `{slot}`,
     /// `{job_dir}` and `{credentials}`.
@@ -155,14 +154,29 @@ pub struct CiConfig {
     /// The cadence.
     #[serde(default)]
     pub cadence: CadenceSection,
-    /// State directory (job directories, caches).
+    /// The dispatcher's own directory (per job: configuration and credential file).
     pub state_dir: PathBuf,
+    /// Where systemd keeps state directories.
+    #[serde(default = "d_state_root")]
+    pub state_root: PathBuf,
+    /// The runner account's state directory below `state_root`: job
+    /// directories (`slots/<slot>/job.<handle>`) and the runner cache
+    /// (`cache/<slot>`) live there.
+    #[serde(default = "d_state_directory")]
+    pub state_directory: String,
     /// Where systemd exposes a unit's credentials.
     #[serde(default = "d_cred_root")]
     pub credentials_root: PathBuf,
     /// The pools.
     #[serde(rename = "pool")]
     pub pools: Vec<PoolSection>,
+}
+
+fn d_state_root() -> PathBuf {
+    PathBuf::from("/var/lib")
+}
+fn d_state_directory() -> String {
+    "forgejo-runner".to_owned()
 }
 
 fn d_cred_root() -> PathBuf {
@@ -198,6 +212,18 @@ impl CiConfig {
             return bad(format!(
                 "runner_url {:?} must be https://host/",
                 self.forge.runner_url
+            ));
+        }
+        if self.state_directory.is_empty()
+            || self.state_directory.starts_with('/')
+            || self
+                .state_directory
+                .split('/')
+                .any(|c| c.is_empty() || c == "..")
+        {
+            return bad(format!(
+                "state_directory {:?} must be a relative path below state_root",
+                self.state_directory
             ));
         }
         let (mut labels, mut slots) = (
@@ -253,6 +279,9 @@ impl CiConfig {
             }
             match pool.kind.as_str() {
                 "host" => {
+                    if pool.run_as.is_none() {
+                        return bad(format!("host pool {} needs `run_as`", pool.label));
+                    }
                     if pool.runner.is_none() || pool.template.is_none() {
                         return bad(format!(
                             "host pool {} needs `runner` and `template`",
@@ -285,31 +314,6 @@ fn is_env_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with(|c: char| c.is_ascii_digit())
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// The uid and gid of an account in a `passwd` file (the static accounts the
-/// deployment declares live there; no name service is consulted).
-///
-/// # Errors
-/// The file is unreadable or the account is not in it.
-pub fn account_ids(passwd: &Path, name: &str) -> Result<(u32, u32), ConfigError> {
-    let text = std::fs::read_to_string(passwd)
-        .map_err(|e| ConfigError::Load(format!("cannot read {}: {e}", passwd.display())))?;
-    for line in text.lines() {
-        let mut f = line.split(':');
-        if f.next() == Some(name) {
-            let (_, uid, gid) = (f.next(), f.next(), f.next());
-            if let (Some(Ok(uid)), Some(Ok(gid))) =
-                (uid.map(str::parse::<u32>), gid.map(str::parse::<u32>))
-            {
-                return Ok((uid, gid));
-            }
-        }
-    }
-    Err(ConfigError::Invalid(format!(
-        "account {name:?} is not in {}",
-        passwd.display()
-    )))
 }
 
 /// Read the forge credential from the credentials directory.
@@ -371,23 +375,21 @@ pub fn build(
             })?)
             .map_err(|e| ConfigError::Load(format!("{}: {e}", template_path.display())))?;
         let mut properties = p.properties.clone();
-        let owner = match &p.run_as {
-            Some(name) => {
-                properties.push(format!("User={name}"));
-                Some(account_ids(Path::new("/etc/passwd"), name)?)
-            }
-            None => None,
-        };
+        if let Some(name) = &p.run_as {
+            properties.push(format!("User={name}"));
+        }
         let settings = HostSettings {
             runner: p.runner.clone().unwrap_or_default(),
             template,
             state_dir: cfg.state_dir.clone(),
-            cache_dir: cfg.state_dir.join("cache"),
+            state_root: cfg.state_root.clone(),
+            state_directory: cfg.state_directory.clone(),
+            scrub_bin: std::env::current_exe()
+                .map_err(|e| ConfigError::Load(format!("cannot find myself: {e}")))?,
             pickup: Duration::from_secs(p.pickup_s),
             properties,
             environment: p.environment.clone().into_iter().collect(),
             slot_environment: Vec::new(),
-            owner,
             credentials_root: cfg.credentials_root.clone(),
             kill_rounds: 50,
             kill_pause: Duration::from_millis(200),

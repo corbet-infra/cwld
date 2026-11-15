@@ -124,10 +124,18 @@ pub struct HostSettings {
     pub runner: PathBuf,
     /// The runner configuration without connection (JSON is YAML).
     pub template: Value,
-    /// The state directory (`slots/<slot>/job.<handle>` below it).
+    /// The dispatcher's own directory: per job a `jobs/<unit>` directory with
+    /// the configuration and the credential file (nothing the runner writes).
     pub state_dir: PathBuf,
-    /// The runner's persistent cache directory root (`cache/<slot>`).
-    pub cache_dir: PathBuf,
+    /// Where systemd's state directories live (`/var/lib`).
+    pub state_root: PathBuf,
+    /// The runner account's state directory, relative to `state_root`
+    /// (`forgejo-runner`). The job unit owns `slots/<slot>/job.<handle>` and
+    /// `cache/<slot>` below it as its own `StateDirectory=`; the job's tree
+    /// is removed by the unit's `ExecStopPost=` as the runner account.
+    pub state_directory: String,
+    /// The binary `ExecStopPost=` runs (`<it> ci scrub <dir>`).
+    pub scrub_bin: PathBuf,
     /// Seconds without a task before the registration is given back.
     pub pickup: Duration,
     /// Unit properties from the deployment.
@@ -138,9 +146,6 @@ pub struct HostSettings {
     pub environment: Vec<(String, String)>,
     /// This slot's own environment values (they replace the pool's by name).
     pub slot_environment: Vec<(String, String)>,
-    /// The account the runner process runs as (uid, gid): the job directories
-    /// are handed to it, because the dispatcher itself is not that account.
-    pub owner: Option<(u32, u32)>,
     /// Where systemd exposes a unit's credentials (`/run/credentials`).
     pub credentials_root: PathBuf,
     /// Kill rounds before a teardown gives up.
@@ -155,6 +160,7 @@ pub struct HostExecutor {
     cfg: HostSettings,
     slot: String,
     job_dir: Option<PathBuf>,
+    own_dir: Option<PathBuf>,
     unit: Option<String>,
 }
 
@@ -167,12 +173,25 @@ impl HostExecutor {
             cfg,
             slot: slot.to_owned(),
             job_dir: None,
+            own_dir: None,
             unit: None,
         }
     }
 
-    fn slot_dir(&self) -> PathBuf {
-        self.cfg.state_dir.join("slots").join(&self.slot)
+    /// The runner-owned part of a job, relative to `state_root`.
+    fn job_state(&self, handle: &str) -> String {
+        format!(
+            "{}/slots/{}/job.{handle}",
+            self.cfg.state_directory, self.slot
+        )
+    }
+
+    fn cache_dir(&self) -> PathBuf {
+        self.cfg
+            .state_root
+            .join(&self.cfg.state_directory)
+            .join("cache")
+            .join(&self.slot)
     }
 
     /// The job's configuration: the template plus exactly one connection.
@@ -187,7 +206,7 @@ impl HostExecutor {
             a.scope.name.clone(): {"url": a.runner_url, "uuid": a.registration.uuid, "token_url": token_url}
         });
         cfg["host"]["workdir_parent"] = json!(job_dir.join("work"));
-        cfg["cache"]["dir"] = json!(self.cfg.cache_dir.join(&self.slot));
+        cfg["cache"]["dir"] = json!(self.cache_dir());
         cfg
     }
 
@@ -228,40 +247,30 @@ impl Executor for HostExecutor {
             reason,
             memory: false,
         };
-        // what a previous incarnation left: its job directories
-        if let Ok(entries) = fs::read_dir(self.slot_dir()) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with("job.") {
-                    scrub(&entry.path()).map_err(|e| fail(e.to_string()))?;
-                }
-            }
-        }
-        let dir = self.slot_dir().join(format!("job.{}", job.handle));
-        let cache = self.cfg.cache_dir.join(&self.slot);
-        fs::create_dir_all(dir.join("work")).map_err(|e| fail(e.to_string()))?;
-        fs::create_dir_all(&cache).map_err(|e| fail(e.to_string()))?;
-        if let Some((uid, gid)) = self.cfg.owner {
-            // the job's directory and its work directory belong to the runner's account; the
-            // credential file and the configuration inside stay the dispatcher's
-            for path in [dir.join("work"), cache] {
-                std::os::unix::fs::chown(&path, Some(uid), Some(gid)).map_err(|e| {
-                    fail(format!("cannot hand {} to the runner: {e}", path.display()))
-                })?;
-            }
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o711))
-                .map_err(|e| fail(e.to_string()))?;
-        }
-        self.job_dir = Some(dir);
-        self.unit = Some(format!("cwld-ci-{}-{}", self.slot, job.handle));
+        let unit = format!("cwld-ci-{}-{}", self.slot, job.handle);
+        // the dispatcher's own directory: configuration and credential file only
+        let own = self.cfg.state_dir.join("jobs").join(&unit);
+        scrub(&own).map_err(|e| fail(e.to_string()))?;
+        fs::create_dir_all(&own).map_err(|e| fail(e.to_string()))?;
+        fs::set_permissions(&own, fs::Permissions::from_mode(0o755))
+            .map_err(|e| fail(e.to_string()))?;
+        // the runner-owned directory is made by systemd when the unit starts
+        self.job_dir = Some(self.cfg.state_root.join(self.job_state(&job.handle)));
+        self.own_dir = Some(own);
+        self.unit = Some(unit);
         Ok(())
     }
 
     fn run(&mut self, a: &Assignment, log: &mut dyn FnMut(&str)) -> RunOutcome {
-        let (Some(dir), Some(unit)) = (self.job_dir.clone(), self.unit.clone()) else {
+        let (Some(dir), Some(own), Some(unit)) = (
+            self.job_dir.clone(),
+            self.own_dir.clone(),
+            self.unit.clone(),
+        ) else {
             return RunOutcome::NotStarted("run without prepare".to_owned());
         };
         // the single-use token: a 0600 file the unit loads as a credential; it is in no argument list
-        let token_file = dir.join("token");
+        let token_file = own.join("token");
         let written = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -270,13 +279,27 @@ impl Executor for HostExecutor {
             .and_then(|mut f| {
                 io::Write::write_all(&mut f, a.registration.token.expose().as_bytes())
             });
-        let config_file = dir.join("config.yml");
+        let config_file = own.join("config.yml");
         let config = self.config(a, &unit, &dir);
         if let Err(e) = written.and_then(|()| fs::write(&config_file, config.to_string())) {
             return RunOutcome::NotStarted(format!("cannot write the job files: {e}"));
         }
         let mut properties = self.cfg.properties.clone();
         properties.push(format!("LoadCredential=reg:{}", token_file.display()));
+        // the job's directory and the runner's cache are the unit's own state directories (owned
+        // by its account, made by systemd); the tree is removed by the unit itself, as that account
+        properties.push(format!(
+            "StateDirectory={} {}/cache/{}",
+            self.job_state(&a.job.handle),
+            self.cfg.state_directory,
+            self.slot
+        ));
+        properties.push("StateDirectoryMode=0755".to_owned());
+        properties.push(format!(
+            "ExecStopPost={} ci scrub {}",
+            self.cfg.scrub_bin.display(),
+            dir.display()
+        ));
         let spec = UnitSpec {
             unit: unit.clone(),
             argv: vec![
@@ -361,11 +384,21 @@ impl Executor for HostExecutor {
                 )));
             }
         }
-        if let Some(dir) = self.job_dir.clone() {
-            scrub(&dir).map_err(|e| {
-                ExecError::Teardown(format!("cannot remove {}: {e}", dir.display()))
+        if let Some(own) = self.own_dir.clone() {
+            scrub(&own).map_err(|e| {
+                ExecError::Teardown(format!("cannot remove {}: {e}", own.display()))
             })?;
         }
+        // the unit removed the runner's tree itself (ExecStopPost): it must be gone
+        if let Some(dir) = self.job_dir.clone()
+            && dir.exists()
+        {
+            return Err(ExecError::Teardown(format!(
+                "{} is still there after the unit ended",
+                dir.display()
+            )));
+        }
+        self.own_dir = None;
         self.job_dir = None;
         self.unit = None;
         Ok(())
