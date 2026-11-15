@@ -1776,7 +1776,7 @@ kind = "vm"
 claim_mib = 24576
 run_as = "forgejo-runner"
 template = "/etc/runner.json"
-slots = [{ id = "mac-0", name = "srv-mac-0" }]
+slots = [{ id = "mac-0", name = "slot-mac-0" }]
 [pool.vm]
 transport = ["/bin/vm-dev", "{slot}", "pipe", "--"]
 wake = ["/bin/vm-dev", "{slot}", "wake"]
