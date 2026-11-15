@@ -1,0 +1,18 @@
+schema = 1
+project = "cwld"
+
+# Select affected checks explicitly; no implicit full language/platform matrix.
+[checks.rust]
+kind = "cargo"
+actions = ["fmt", "test", "clippy"]
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"]]
+
+[render]
+render_schema = 2
+
+[jobs.verify]
+scheduler = "forgejo"
+runs_on = "linux"
+checks = ["rust"]
+workflow = "ci"
+command = ["bash", ".ci/run-cached.sh"]

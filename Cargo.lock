@@ -55,6 +55,7 @@ dependencies = [
 [[package]]
 name = "cdct"
 version = "0.1.0"
+source = "git+https://git.corbet.ch/corbet-infra/cdct.git?branch=main#1ebddd5d2f545ccad0f74a2b9ed96d26e191701b"
 dependencies = [
  "cdrv",
  "clap",
@@ -67,6 +68,7 @@ dependencies = [
 [[package]]
 name = "cdrv"
 version = "0.1.0"
+source = "git+https://git.corbet.ch/corbet-infra/cdrv.git?branch=main#ceb9586e711fa3297817e1bba751685d42fca5c5"
 dependencies = [
  "serde",
  "serde_json",

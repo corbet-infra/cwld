@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
 description = "The workload runtime: classes, lifecycle and plan execution for VMs, containers and jails"
-repository = "https://github.com/corbet-infra/cwld"
+repository = "https://git.corbet.ch/corbet-infra/cwld"
 
 [lib]
 name = "cwld"
@@ -15,19 +15,13 @@ name = "cwld"
 path = "src/main.rs"
 
 [dependencies]
-cdct = { path = "../cdct" }
+cdct = { git = "https://git.corbet.ch/corbet-infra/cdct.git", branch = "main" }
 cdrv = { git = "https://git.corbet.ch/corbet-infra/cdrv.git", branch = "main" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 toml = "1"
-
-# `cdrv` is named by its git URL, so this crate builds from the URL alone.
-# During local development the patch below resolves that URL to the sibling
-# checkout instead; delete the table to build against the URL (see README).
-[patch."https://git.corbet.ch/corbet-infra/cdrv.git"]
-cdrv = { path = "../cdrv" }
 
 [lints.rust]
 unsafe_code = "forbid"
