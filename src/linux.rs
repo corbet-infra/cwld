@@ -10,6 +10,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cdct::{Client, Endpoint, Reply, Request, SwitchPlan};
@@ -338,6 +340,24 @@ pub fn follow(path: &Path) -> Result<(), String> {
             journal.not_started().len()
         );
     }
+    // SIGTERM never cuts a plan: while one runs, the stop waits for it to end
+    // (a half-bound card or a half-stopped guest is the worst state to leave);
+    // when idle, the process exits at once.
+    let busy = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::new(AtomicBool::new(false));
+    {
+        let busy = Arc::clone(&busy);
+        let stopping = Arc::clone(&stopping);
+        ctrlc::set_handler(move || {
+            stopping.store(true, Ordering::SeqCst);
+            if !busy.load(Ordering::SeqCst) {
+                println!("cwld: stopping (no plan in flight)");
+                std::process::exit(0);
+            }
+            println!("cwld: stopping after the plan in flight");
+        })
+        .map_err(|error| format!("cannot install the stop handler: {error}"))?;
+    }
     let mut client = Client::connect(&Endpoint::LocalSocket(config.conductor.clone()))
         .map_err(|error| format!("cannot reach the conductor: {error}"))?;
     client
@@ -357,12 +377,17 @@ pub fn follow(path: &Path) -> Result<(), String> {
                 plan.target,
                 plan.steps.len()
             );
+            busy.store(true, Ordering::SeqCst);
             match execute(&mut runtime, &config, &plan) {
                 Ok(done) => report(&done),
                 Err(message) => eprintln!(
                     "cwld: the plan to {} was NOT started: {message}",
                     plan.target
                 ),
+            }
+            busy.store(false, Ordering::SeqCst);
+            if stopping.load(Ordering::SeqCst) {
+                return Ok(());
             }
         }
     }

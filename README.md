@@ -76,7 +76,9 @@ Built with the `clnx` feature, `cwld` links the Linux host drivers and
 socket and runs every plan the conductor pushes as `granted` (a `cdct switch`
 from the CLI, a tray click). It decides nothing and polls nothing; when the
 conductor's stream ends it exits non-zero, so the service manager restarts it
-(the conductor is socket-activated). Each plan connects the drivers afresh:
+(the conductor is socket-activated). SIGTERM never cuts a plan: while one
+runs the process exits after it; when idle it exits at once (run it with
+`KillMode=mixed` so the drivers' helper processes are not signalled first). Each plan connects the drivers afresh:
 libvirt, sysfs, `modprobe`, the systemd manager that owns the desktop session
 (a container's own system bus when the session runs in one, resolved from the
 container's init pid at that moment), and Kubernetes. The live replica counts
