@@ -131,7 +131,7 @@ pub struct HostSettings {
     pub state_root: PathBuf,
     /// The runner account's state directory, relative to `state_root`
     /// (`forgejo-runner`). The job unit owns `slots/<slot>/job.<handle>` and
-    /// `cache/<slot>` below it as its own `StateDirectory=`; the job's tree
+    /// `cache/<slot>` below it, writable in the unit as part of its `StateDirectory=` (the whole directory); the job's tree
     /// is removed by the unit's `ExecStopPost=` as the runner account.
     pub state_directory: String,
     /// A command (argv) run as its own unit, as the job's account, before the
@@ -338,20 +338,17 @@ impl Executor for HostExecutor {
         properties.push(format!("LoadCredential=reg:{}", token_file.display()));
         // the job's directory and the runner's cache are the unit's own state directories (owned
         // by its account, made by systemd); the tree is removed by the unit itself, as that account
-        properties.push(format!(
-            "StateDirectory={sd}/slots/{slot} {sd}/cache/{slot}",
-            sd = self.cfg.state_directory,
-            slot = self.slot
-        ));
+        properties.push(format!("StateDirectory={}", self.cfg.state_directory));
         properties.push("StateDirectoryMode=0755".to_owned());
         properties.push(format!(
             "ExecStopPost={} ci scrub {}",
             self.cfg.scrub_bin.display(),
             dir.display()
         ));
-        // the unit's own state directory is the SLOT directory: below it (a writable mount in the unit's sandbox) the job's
-        // tree `job.<handle>` is made by the runner and removed by ExecStopPost; a per-job state directory could not be removed
-        // from inside the unit (its parent is read-only there, ProtectSystem=strict)
+        // the unit's state directory is the runner account's WHOLE one (what the old slot units had): HOME, the XDG cache (nix fetcher
+        // locks), cargo and rustup binds, `cache/<slot>`, `slots/<slot>` are all writable in the unit's sandbox (ProtectSystem=strict).
+        // The job's tree `job.<handle>` below it is made by the runner and removed by ExecStopPost; a per-job state directory could
+        // neither be removed from inside the unit nor leave HOME's caches writable
         let slot_dir = self
             .cfg
             .state_root

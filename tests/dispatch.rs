@@ -491,9 +491,7 @@ fn a_job_runs_in_a_fresh_unit_and_leaves_nothing() {
     );
     // the runner's tree is the unit's own state directory, removed by the unit as its account
     let has = |p: String| spec.properties.contains(&p);
-    assert!(has(
-        "StateDirectory=runner/slots/0 runner/cache/0".to_owned()
-    ));
+    assert!(has("StateDirectory=runner".to_owned()));
     assert!(has(format!(
         "ExecStopPost=/usr/bin/cwld ci scrub {}",
         rig.dir
@@ -1528,6 +1526,49 @@ fn the_scrub_command_removes_job_directories_and_nothing_else() {
     assert!(dir.exists());
     assert!(run(&job).success());
     assert!(!job.exists());
+}
+
+#[test]
+fn every_path_the_runner_writes_is_below_the_units_state_directory() {
+    // the sandbox is ProtectSystem=strict: only the unit's StateDirectory is writable below /var/lib (the old slot units had the whole
+    // directory; a narrower one left the XDG cache, nix fetcher locks, cargo and kache state read-only, 2026-11-16)
+    let rig = Rig::host(
+        &["0"],
+        vec![plain(&[], 0)],
+        0,
+        vec![(org("o1"), job(1, HANDLE_A, "linux"))],
+        FakeAdmission::granting(),
+        100,
+    );
+    rig.run_cycle();
+    let st = lock(&rig.units.state);
+    let spec = &st.started[0];
+    let sd = spec
+        .properties
+        .iter()
+        .find_map(|p| p.strip_prefix("StateDirectory="))
+        .expect("a state directory");
+    assert_eq!(sd, "runner", "the runner account's whole state directory");
+    let root = rig.dir.join("var-lib").join(sd);
+    let cfg: serde_json::Value = serde_json::from_str(&st.config_seen[0]).expect("config");
+    for (what, path) in [
+        ("workdir_parent", cfg["host"]["workdir_parent"].as_str()),
+        ("cache dir", cfg["cache"]["dir"].as_str()),
+    ] {
+        let p = std::path::Path::new(path.unwrap_or_else(|| panic!("{what} set")));
+        assert!(p.starts_with(&root), "{what} {p:?} is below {root:?}");
+    }
+    // HOME (the XDG cache, cargo, rustup binds live below it) is the state directory itself
+    let home = spec
+        .environment
+        .iter()
+        .find(|(k, _)| k == "HOME")
+        .expect("HOME");
+    assert!(
+        std::path::Path::new(&home.1).starts_with("/var/lib/jobs")
+            || home.1.starts_with("/var/lib/"),
+        "HOME is below /var/lib"
+    );
 }
 
 #[test]
