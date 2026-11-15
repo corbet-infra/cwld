@@ -471,9 +471,10 @@ impl Runtime {
                 }
             }
             InstanceState::Stopping => {}
-            InstanceState::Starting => {
-                // The contract's table has no stop from Starting; the refusal
-                // is typed and the plan stops here.
+            InstanceState::Starting | InstanceState::Paused => {
+                // The contract's table has no stop from Starting or Paused (a
+                // paused guest cannot answer a clean stop); the refusal is
+                // typed and the plan stops here.
                 let _refused =
                     self.lifecycle_mut(instance)
                         .advance(Trigger::Stop, log, at, instance)?;

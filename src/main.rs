@@ -323,6 +323,7 @@ impl HostDevices for LoggingHost {
             class: DeviceClass::Gpu,
             iommu_group: None,
             driver: None,
+            bar0_bytes: None,
         }])
     }
 

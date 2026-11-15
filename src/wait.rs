@@ -193,6 +193,7 @@ fn lifecycle_state(event: &Event, instance: &InstanceId) -> Option<InstanceState
         "instance.starting" => Some(InstanceState::Starting),
         "instance.running" => Some(InstanceState::Running),
         "instance.stopping" => Some(InstanceState::Stopping),
+        "instance.paused" => Some(InstanceState::Paused),
         "instance.stopped" => Some(InstanceState::Stopped),
         "instance.failed" => Some(InstanceState::Failed(failure_text(&event.data))),
         _ => None,
