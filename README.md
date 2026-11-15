@@ -81,9 +81,15 @@ driver failure event, an exhausted stream, the deadline on the fake clock, the
 CI job cycle including reset, crash recovery of a dirty ephemeral instance,
 half-run plan reporting, and class data validation.
 
-`Cargo.toml` patches `cdct`'s git-sourced `cdrv` to the local path so the two
-crates share one contract version; the patch goes away when `cwld` follows the
-published crates.
+### One `cdrv`
+
+`Cargo.toml` names `cdrv` by its git URL, so `cwld` builds from the URL alone.
+During local development a `[patch]` table resolves that URL to the sibling
+`../cdrv` checkout, so `cdct`, `cwld` and `cdrv` are always compiled against the
+same contract at the same commit. To build against the published contract
+instead, delete the `[patch."https://git.corbet.ch/corbet-infra/cdrv.git"]`
+table and let cargo fetch `cdrv` from the URL; the URL must carry the contract
+commit the code is written against.
 
 ## License
 

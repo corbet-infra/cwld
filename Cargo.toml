@@ -16,16 +16,16 @@ path = "src/main.rs"
 
 [dependencies]
 cdct = { path = "../cdct" }
-cdrv = { path = "../cdrv" }
+cdrv = { git = "https://git.corbet.ch/corbet-infra/cdrv.git", branch = "main" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 toml = "1"
 
-# `cdct` names `cdrv` by its git URL; the two crates are one contract at one
-# commit, so patch the git source to the local path. The patch goes away when
-# `cwld` follows the published crates.
+# `cdrv` is named by its git URL, so this crate builds from the URL alone.
+# During local development the patch below resolves that URL to the sibling
+# checkout instead; delete the table to build against the URL (see README).
 [patch."https://git.corbet.ch/corbet-infra/cdrv.git"]
 cdrv = { path = "../cdrv" }
 
