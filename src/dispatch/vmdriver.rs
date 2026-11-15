@@ -106,7 +106,11 @@ fn valid_token(token: &str) -> bool {
 /// The payload script the guest session runs (`bash -s`); a port of `runner-vm-slot`'s
 /// `build_payload`. Everything that is not plain text travels base64-encoded in a quoted
 /// here-document, so no value is ever interpreted by the guest's shell.
-fn payload(settings: &VmSettings, a: &Assignment, pickup: Duration) -> Result<String, VmError> {
+pub fn guest_payload(
+    settings: &VmSettings,
+    a: &Assignment,
+    pickup: Duration,
+) -> Result<String, VmError> {
     let bad = |what: &str| VmError::Failed(format!("refusing the assignment: {what}"));
     let handle = &a.job.handle;
     if !super::forge::is_handle(handle) {
@@ -284,7 +288,7 @@ impl<H: VmHost> VmDriver for RuntimeVmDriver<H> {
             args: vec!["-s".to_owned()],
             timeout: self.settings.job_timeout,
             // the registration travels on standard input only
-            stdin: Some(payload(&self.settings, assignment, pickup)?.into_bytes()),
+            stdin: Some(guest_payload(&self.settings, assignment, pickup)?.into_bytes()),
         };
         let mut lines = Lines::default();
         let mut aborted = false;

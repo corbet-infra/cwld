@@ -1416,6 +1416,7 @@ fn output_that_is_not_utf8_neither_ends_the_stream_nor_hides_the_cancel_line() {
         workdir: dir.clone(),
         properties: Vec::new(),
         environment: Vec::new(),
+        stdin: Some(b"fed through\n".to_vec()),
     };
     let mut unit = runner.start(&spec).expect("start");
     let mut lines = Vec::new();
@@ -1605,5 +1606,186 @@ fn the_slot_stays_busy_until_the_roll_back_works() {
     assert!(
         rig.dispatcher.busy_slots().is_empty(),
         "free only after it succeeded"
+    );
+}
+
+// --- VM pools as commands of the pool's account -------------------------------------------------------------------------------
+
+fn vm_assignment() -> Assignment {
+    Assignment {
+        job: JobRef {
+            handle: HANDLE_A.to_owned(),
+            label: "macos".to_owned(),
+            slot: "mac-0".to_owned(),
+        },
+        scope: org("o1"),
+        runner_url: "https://forge.example/".to_owned(),
+        registration: Registration {
+            uuid: "00000000-0000-0000-0000-000000000001".to_owned(),
+            token: Secret::new("single-use-token"),
+        },
+    }
+}
+
+fn unit_vm(
+    scripts: Vec<Script>,
+    standby: bool,
+) -> (cwld::dispatch::unitvm::UnitVmDriver, Arc<FakeUnits>) {
+    use cwld::dispatch::unitvm::{UnitVmDriver, VmCommands};
+    use cwld::dispatch::vmdriver::VmSettings;
+    let units = FakeUnits::new(scripts, 0);
+    let cmd = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    let driver = UnitVmDriver::new(
+        units.clone(),
+        VmCommands {
+            transport: cmd(&["/bin/vm-dev", "{slot}", "pipe", "--"]),
+            ensure_clean: cmd(&["/bin/vm-dev", "{slot}", "ensure-clean"]),
+            wake: cmd(&["/bin/vm-dev", "{slot}", "wake"]),
+            sync: cmd(&["/bin/vm-dev", "{slot}", "sync"]),
+            reset: cmd(&["/bin/vm-dev", "{slot}", "reset"]),
+            standby: if standby {
+                cmd(&["/bin/vm-dev", "{slot}", "standby"])
+            } else {
+                Vec::new()
+            },
+        },
+        VmSettings::default(),
+        vec!["User=jobs".to_owned()],
+        Vec::new(),
+        temp("vm-workdir"),
+        |_| {},
+    );
+    (driver, units)
+}
+
+#[test]
+fn a_vm_job_is_commands_of_the_pool_account_with_the_payload_on_stdin() {
+    let (driver, units) = unit_vm(
+        vec![
+            plain(&[], 0),
+            plain(&[], 0),
+            plain(&[], 0),
+            plain(&["job ran"], 0),
+            plain(&[], 0),
+        ],
+        false,
+    );
+    driver.ensure_clean("mac-0").unwrap();
+    driver.start("mac-0").unwrap();
+    let mut lines = Vec::new();
+    let exit = driver
+        .run_job(
+            "mac-0",
+            &vm_assignment(),
+            Duration::from_secs(30),
+            &mut |l| {
+                lines.push(l.to_owned());
+                Flow::Continue
+            },
+        )
+        .unwrap();
+    driver.stop_and_reset("mac-0").unwrap();
+    assert_eq!(exit, VmExit::Code(0));
+    assert_eq!(lines, ["job ran"]);
+    let st = lock(&units.state);
+    let verbs: Vec<_> = st.started.iter().map(|s| s.argv[2..].join(" ")).collect();
+    assert_eq!(verbs[0], "ensure-clean");
+    assert_eq!(verbs[1], "wake");
+    assert_eq!(verbs[2], "sync");
+    assert_eq!(verbs[4], "reset");
+    let session = &st.started[3];
+    assert_eq!(
+        session.argv,
+        ["/bin/vm-dev", "mac-0", "pipe", "--", "bash", "-s"]
+    );
+    let stdin = String::from_utf8(session.stdin.clone().unwrap()).unwrap();
+    assert!(stdin.contains("vm-guest-job"));
+    assert!(
+        !stdin.contains("single-use-token"),
+        "only base64 in the payload"
+    );
+    assert!(
+        st.started
+            .iter()
+            .all(|s| s.properties.contains(&"User=jobs".to_owned())
+                && s.unit.starts_with("cwld-ci-vm-mac-0-")),
+        "every operation is a unit of the pool's account, named for the polkit rule"
+    );
+    assert!(
+        st.started
+            .iter()
+            .all(|s| !s.argv.join(" ").contains("single-use-token")
+                && !s.properties.join(" ").contains("single-use-token"))
+    );
+}
+
+#[test]
+fn a_refused_wake_is_the_memory_guard_and_no_task_is_status_75() {
+    use cwld::dispatch::exec::VmError;
+    let (driver, _) = unit_vm(vec![plain(&[], 75)], false);
+    assert!(matches!(driver.start("mac-0"), Err(VmError::NoMemory)));
+    let (driver, _) = unit_vm(vec![plain(&[], 75)], false);
+    let exit = driver
+        .run_job(
+            "mac-0",
+            &vm_assignment(),
+            Duration::from_secs(30),
+            &mut |_| Flow::Continue,
+        )
+        .unwrap();
+    assert_eq!(exit, VmExit::NoTask);
+}
+
+#[test]
+fn the_cancel_line_kills_the_guest_session_unit() {
+    let (driver, units) = unit_vm(
+        vec![Script {
+            lines: vec!["unauthenticated: unregistered runner".to_owned()],
+            pick: false,
+            behaviour: Behaviour::Hang,
+        }],
+        false,
+    );
+    let mut exec =
+        cwld::dispatch::exec::VmExecutor::new(Arc::new(driver), "mac-0", Duration::from_secs(30));
+    let outcome = exec.run(&vm_assignment(), &mut |_| {});
+    assert_eq!(outcome, RunOutcome::Cancelled);
+    assert_eq!(lock(&units.state).killed.len(), 1);
+}
+
+#[test]
+fn a_failed_standby_rolls_the_clone_back_again() {
+    let (driver, units) = unit_vm(vec![plain(&[], 0), plain(&[], 1), plain(&[], 0)], true);
+    driver.stop_and_reset("mac-0").unwrap();
+    let st = lock(&units.state);
+    let verbs: Vec<_> = st.started.iter().map(|s| s.argv[2].clone()).collect();
+    assert_eq!(verbs, ["reset", "standby", "reset"]);
+}
+
+#[test]
+fn a_vm_pool_needs_its_account_template_and_commands() {
+    let base = r#"
+state_dir = "/var/lib/cwld-ci"
+[forge]
+api = "https://forge.example/api/v1"
+runner_url = "https://forge.example/"
+runner_version = "v13.1.0"
+[[pool]]
+label = "macos"
+kind = "vm"
+claim_mib = 24576
+run_as = "forgejo-runner"
+template = "/etc/runner.json"
+slots = [{ id = "mac-0", name = "srv-mac-0" }]
+[pool.vm]
+transport = ["/bin/vm-dev", "{slot}", "pipe", "--"]
+wake = ["/bin/vm-dev", "{slot}", "wake"]
+reset = ["/bin/vm-dev", "{slot}", "reset"]
+"#;
+    assert!(CiConfig::parse(base).is_ok());
+    assert!(CiConfig::parse(&base.replace("run_as = \"forgejo-runner\"\n", "")).is_err());
+    assert!(
+        CiConfig::parse(&base.replace("reset = [\"/bin/vm-dev\", \"{slot}\", \"reset\"]\n", ""))
+            .is_err()
     );
 }

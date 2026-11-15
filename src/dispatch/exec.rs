@@ -211,6 +211,7 @@ impl HostExecutor {
             workdir: dir.to_path_buf(),
             properties: self.cfg.properties.clone(),
             environment: self.environment(unit_base, dir),
+            stdin: None,
         };
         let mut running = self
             .units
@@ -363,6 +364,7 @@ impl Executor for HostExecutor {
             workdir: dir.clone(),
             properties,
             environment: self.environment(&unit, &dir),
+            stdin: None,
         };
         let mut running = match self.units.start(&spec) {
             Ok(r) => r,

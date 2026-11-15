@@ -28,6 +28,10 @@ pub struct UnitSpec {
     /// The job's environment (`NAME`, value). Paths and ports, never a secret:
     /// they travel in an argument list.
     pub environment: Vec<(String, String)>,
+    /// Bytes for the unit's standard input, written once and then closed
+    /// (`systemd-run --pipe` carries them): a credential travels here, never
+    /// in `argv`. `None` gives the unit no input.
+    pub stdin: Option<Vec<u8>>,
 }
 
 /// One event of a running unit's output.
@@ -173,10 +177,20 @@ impl UnitRunner for SystemdRun {
         }
         cmd.arg("--").args(&spec.argv);
         let mut child = cmd
-            .stdin(Stdio::null())
+            .stdin(if spec.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        if let (Some(bytes), Some(mut stdin)) = (spec.stdin.clone(), child.stdin.take()) {
+            // a thread: a full pipe must not block the output reader
+            std::thread::spawn(move || {
+                let _ = std::io::Write::write_all(&mut stdin, &bytes);
+            });
+        }
         let (tx, rx) = mpsc::channel();
         if let Some(out) = child.stdout.take() {
             pump(out, tx.clone());

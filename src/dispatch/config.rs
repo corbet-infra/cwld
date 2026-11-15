@@ -11,12 +11,14 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::admission::Admission;
-use super::exec::{Executor, HostExecutor, HostSettings};
+use super::exec::{Executor, HostExecutor, HostSettings, VmDriver, VmExecutor};
 use super::flow::{Dispatcher, ExecutorFactory, Pool, SlotCfg, Tuning};
 use super::forge::{ForgeClient, is_name};
 use super::http::CurlHttp;
 use super::secret::Secret;
 use super::units::{SystemdRun, UnitRunner};
+use super::unitvm::{UnitVmDriver, VmCommands};
+use super::vmdriver::VmSettings;
 
 /// A configuration problem.
 #[derive(Debug, thiserror::Error)]
@@ -111,6 +113,62 @@ pub struct SlotSection {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// A credential file shipped into a VM job.
+pub struct VmCredential {
+    /// The name in the job's credentials directory (`sccache-aws`).
+    pub name: String,
+    /// The host path (a credential of the dispatcher's own unit).
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// How a `vm` pool reaches its clones: commands run as units of `run_as`.
+/// `{slot}` in an argument is the instance.
+pub struct VmSection {
+    /// The guest transport; the guest command is appended.
+    pub transport: Vec<String>,
+    /// Roll a dirty clone back first (optional).
+    #[serde(default)]
+    pub ensure_clean: Vec<String>,
+    /// Start the clone; status 75 means the memory guard refused.
+    pub wake: Vec<String>,
+    /// Install the guest tools (optional).
+    #[serde(default)]
+    pub sync: Vec<String>,
+    /// Power off and roll back to the clean snapshot.
+    pub reset: Vec<String>,
+    /// Boot clean and hibernate (optional).
+    #[serde(default)]
+    pub standby: Vec<String>,
+    /// The guest path of the job script.
+    #[serde(default = "d_guest_job")]
+    pub guest_job: String,
+    /// The guest directory below which a job directory is made.
+    #[serde(default = "d_guest_tmp")]
+    pub guest_tmp: String,
+    /// Credentials shipped with each job.
+    #[serde(default)]
+    pub credentials: Vec<VmCredential>,
+    /// The placement view ccid reads (optional).
+    pub placement: Option<PathBuf>,
+    /// Seconds a guest job may run.
+    #[serde(default = "d_job_timeout")]
+    pub job_timeout_s: u64,
+}
+
+fn d_guest_job() -> String {
+    "/Volumes/cache/bin/vm-guest-job".to_owned()
+}
+fn d_guest_tmp() -> String {
+    "/tmp".to_owned()
+}
+fn d_job_timeout() -> u64 {
+    3 * 3600 + 600
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 /// One pool.
 pub struct PoolSection {
     /// The label.
@@ -131,6 +189,8 @@ pub struct PoolSection {
     /// Host pools: unit properties from the deployment.
     #[serde(default)]
     pub properties: Vec<String>,
+    /// VM pools: how the clones are reached.
+    pub vm: Option<VmSection>,
     /// Host pools: the account the runner process runs as. The dispatcher
     /// starts the unit with `User=` this name; a host pool must name one (a
     /// transient unit would otherwise run as root).
@@ -297,7 +357,26 @@ impl CiConfig {
                         ));
                     }
                 }
-                "vm" => {}
+                "vm" => {
+                    if pool.run_as.is_none() || pool.template.is_none() {
+                        return bad(format!(
+                            "vm pool {} needs `run_as` and `template`",
+                            pool.label
+                        ));
+                    }
+                    match &pool.vm {
+                        Some(vm)
+                            if !vm.transport.is_empty()
+                                && !vm.wake.is_empty()
+                                && !vm.reset.is_empty() => {}
+                        _ => {
+                            return bad(format!(
+                                "vm pool {} needs a [pool.vm] section with `transport`, `wake` and `reset`",
+                                pool.label
+                            ));
+                        }
+                    }
+                }
                 other => return bad(format!("pool {}: unknown kind {other:?}", pool.label)),
             }
         }
@@ -353,6 +432,7 @@ pub fn build(
     admission: Arc<dyn Admission>,
     log: impl Fn(&str) + Send + Sync + 'static,
 ) -> Result<Dispatcher, ConfigError> {
+    let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(log);
     let forge = Arc::new(ForgeClient::new(
         Arc::new(CurlHttp::default()),
         &cfg.forge.api,
@@ -370,12 +450,6 @@ pub fn build(
     }
     let mut pools = Vec::new();
     for p in &cfg.pools {
-        if p.kind != "host" {
-            return Err(ConfigError::Invalid(format!(
-                "pool {}: no OS driver (clnx host and guest adapters) is linked into this binary yet; `vmdriver::RuntimeVmDriver` is ready for it, only host pools are served",
-                p.label
-            )));
-        }
         let template_path = p.template.clone().unwrap_or_default();
         let template: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&template_path).map_err(|e| {
@@ -405,6 +479,46 @@ pub fn build(
             kill_pause: Duration::from_millis(200),
         };
         let units = Arc::clone(&units);
+        if p.kind == "vm" {
+            // validated: a vm pool has its section
+            let vm = p.vm.clone().unwrap_or_else(unreachable_vm);
+            let driver: Arc<dyn VmDriver> = Arc::new(UnitVmDriver::new(
+                units.clone(),
+                VmCommands {
+                    transport: vm.transport,
+                    ensure_clean: vm.ensure_clean,
+                    wake: vm.wake,
+                    sync: vm.sync,
+                    reset: vm.reset,
+                    standby: vm.standby,
+                },
+                VmSettings {
+                    template: settings.template.clone(),
+                    guest_job: vm.guest_job,
+                    guest_tmp: vm.guest_tmp,
+                    credentials: vm
+                        .credentials
+                        .into_iter()
+                        .map(|c| (c.name, c.path))
+                        .collect(),
+                    placement: vm.placement,
+                    job_timeout: Duration::from_secs(vm.job_timeout_s),
+                },
+                settings.properties.clone(),
+                settings.environment.clone(),
+                settings.state_root.join(&settings.state_directory),
+                {
+                    let log = Arc::clone(&log);
+                    move |line| log(line)
+                },
+            ));
+            let pickup = settings.pickup;
+            let factory: ExecutorFactory = Arc::new(move |slot: &str| -> Box<dyn Executor> {
+                Box::new(VmExecutor::new(driver.clone(), slot, pickup))
+            });
+            pools.push(pool_of(p, factory));
+            continue;
+        }
         let slot_env: HashMap<String, Vec<(String, String)>> = p
             .slots
             .iter()
@@ -415,19 +529,46 @@ pub fn build(
             settings.slot_environment = slot_env.get(slot).cloned().unwrap_or_default();
             Box::new(HostExecutor::new(units.clone(), settings, slot))
         });
-        pools.push(Pool {
-            label: p.label.clone(),
-            claim_mib: p.claim_mib,
-            slots: p
-                .slots
-                .iter()
-                .map(|s| SlotCfg {
-                    id: s.id.clone(),
-                    name: s.name.clone(),
-                })
-                .collect(),
-            factory,
-        });
+        pools.push(pool_of(p, factory));
     }
-    Ok(Dispatcher::new(forge, admission, pools, cfg.tuning(), log))
+    Ok(Dispatcher::new(
+        forge,
+        admission,
+        pools,
+        cfg.tuning(),
+        move |line| log(line),
+    ))
+}
+
+fn unreachable_vm() -> VmSection {
+    // the loader refuses a vm pool without its section
+    VmSection {
+        transport: Vec::new(),
+        ensure_clean: Vec::new(),
+        wake: Vec::new(),
+        sync: Vec::new(),
+        reset: Vec::new(),
+        standby: Vec::new(),
+        guest_job: d_guest_job(),
+        guest_tmp: d_guest_tmp(),
+        credentials: Vec::new(),
+        placement: None,
+        job_timeout_s: d_job_timeout(),
+    }
+}
+
+fn pool_of(p: &PoolSection, factory: ExecutorFactory) -> Pool {
+    Pool {
+        label: p.label.clone(),
+        claim_mib: p.claim_mib,
+        slots: p
+            .slots
+            .iter()
+            .map(|s| SlotCfg {
+                id: s.id.clone(),
+                name: s.name.clone(),
+            })
+            .collect(),
+        factory,
+    }
 }
