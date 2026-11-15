@@ -19,6 +19,7 @@
 //! - [`dirty`] and [`journal`] are the crash-recovery marks: a dirty mark per
 //!   instance and the journal of a plan in flight;
 //! - [`ci`] runs one CI job as ensure clean, start, exec, stop, reset;
+//! - [`dispatch`] is the CI dispatcher behind `cwld ci`;
 //! - [`recovery`] reports what a crash left behind, without guessing;
 //! - [`runtime`] ties the pieces together.
 //!
@@ -38,6 +39,7 @@
 pub mod ci;
 pub mod classes;
 pub mod dirty;
+pub mod dispatch;
 pub mod handoff;
 pub mod journal;
 pub mod lifecycle;

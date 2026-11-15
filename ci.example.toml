@@ -1,0 +1,23 @@
+# cwld ci serve --config ci.example.toml   (the deployment, nixci, writes the real file)
+# The read-scope forge credential is NOT here: it is the systemd credential `mint`
+# (CREDENTIALS_DIRECTORY/mint) of the unit that runs `cwld ci serve`.
+state_dir = "/var/lib/cwld-ci"
+
+[forge]
+api = "https://forge.example/api/v1"
+runner_url = "https://forge.example/"
+runner_version = "v13.1.0"
+
+[cadence]            # the one polling exception: Forgejo has no "job waiting" push
+poll_ms = 1500       # while work was seen in the last minute
+idle_ms = 4000       # otherwise; nothing is asked while every slot is busy
+
+[[pool]]
+label = "linux"
+kind = "host"        # a transient unit per job, cgroup.kill at the end
+claim_mib = 2048
+pickup_s = 20
+runner = "/run/current-system/sw/bin/forgejo-runner"
+template = "/etc/cwld-ci/runner.json"
+properties = ["User=forgejo-runner", "Delegate=yes", "ProtectProc=invisible", "MemoryMax=infinity"]
+slots = [{ id = "0", name = "srv-0" }, { id = "1", name = "srv-1" }]

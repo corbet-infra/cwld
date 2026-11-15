@@ -37,12 +37,73 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// The CI dispatcher: Forgejo jobs onto clean one-job instances.
+    #[command(subcommand)]
+    Ci(CiCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum CiCommand {
+    /// Serve until SIGTERM; a drain never cuts a job in progress.
+    Serve {
+        /// The dispatcher configuration (TOML).
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Validate a configuration file and print what it would serve.
+    Check {
+        /// The dispatcher configuration (TOML).
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::RunPlan { plan, dry_run } => run_plan(&plan, dry_run),
+        Command::Ci(CiCommand::Check { config }) => ci_check(&config),
+        Command::Ci(CiCommand::Serve { config }) => ci_serve(&config),
+    }
+}
+
+fn ci_check(path: &Path) -> ExitCode {
+    match cwld::dispatch::config::CiConfig::load(path) {
+        Ok(cfg) => {
+            for pool in &cfg.pools {
+                println!("pool {} ({}): {} slot(s), {} MiB per job", pool.label, pool.kind, pool.slots.len(), pool.claim_mib);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("cwld: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn ci_serve(path: &Path) -> ExitCode {
+    use cwld::dispatch::admission::{ConductorAdmission, system_snapshot};
+    use cwld::dispatch::config::{CiConfig, build, read_credential};
+    let run = || -> Result<(), String> {
+        let cfg = CiConfig::load(path).map_err(|e| e.to_string())?;
+        let creds = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
+        let token = read_credential(creds.as_deref(), &cfg.forge.credential).map_err(|e| e.to_string())?;
+        let admission = std::sync::Arc::new(ConductorAdmission::new(cdct::Conductor::with_defaults(), system_snapshot));
+        let dispatcher = std::sync::Arc::new(
+            build(&cfg, token, admission, |line| println!("{line}")).map_err(|e| e.to_string())?,
+        );
+        let stopper = std::sync::Arc::clone(&dispatcher);
+        ctrlc::set_handler(move || stopper.stop()).map_err(|e| e.to_string())?;
+        dispatcher.run();
+        Ok(())
+    };
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("cwld: {message}");
+            ExitCode::FAILURE
+        }
     }
 }
 
