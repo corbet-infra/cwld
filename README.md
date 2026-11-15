@@ -57,10 +57,11 @@ cwld run-plan --plan plan.json --dry-run
 
 `plan.json` is a `cdct::SwitchPlan`, or the JSON that `cdct plan switch --json`
 prints (the plan is taken from it). The dry run prints every call the driver
-would receive. `--gpu <domain:bus:slot.function>` names the card; the default
-`0000:01:00.0` is a synthetic placeholder, never a host fact. Without
-`--dry-run` the command fails: no OS driver crate is linked in this iteration.
-Exit status: `0` complete, `2` a step failed, `1` error.
+would receive. A handover names the card as the hardware inventory does; the
+dry run resolves that name through its logging fake host to one synthetic PCI
+function (`0000:01:00.0`), which is printed, never used, and is not a host
+fact. Without `--dry-run` the command fails: no OS driver crate is linked in
+this iteration. Exit status: `0` complete, `2` a step failed, `1` error.
 
 ## How to run the tests
 

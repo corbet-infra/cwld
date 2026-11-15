@@ -12,8 +12,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use cdrv::{
-    DeviceAddress, Event, EventLog, InstanceClass, InstanceId, InstanceSpec, InstanceState,
-    Severity, StopMode, Subject, Timestamp,
+    Event, EventLog, InstanceClass, InstanceId, InstanceSpec, InstanceState, Severity, StopMode,
+    Subject, Timestamp,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -108,7 +108,6 @@ impl CleanOutcome {
 pub struct Runtime {
     classes: ClassCatalog,
     wait: WaitPolicy,
-    gpu: Option<DeviceAddress>,
     marks: DirtyMarks,
     journals: Journals,
     specs: BTreeMap<InstanceId, InstanceSpec>,
@@ -123,20 +122,12 @@ impl Runtime {
         Ok(Self {
             classes,
             wait: WaitPolicy::default(),
-            gpu: None,
             marks: DirtyMarks::new(root.join("dirty"))?,
             journals: Journals::new(root.join("plans"))?,
             specs: BTreeMap::new(),
             lifecycles: BTreeMap::new(),
             clock: Box::new(SystemClock),
         })
-    }
-
-    /// Set the GPU the handover steps bind and unbind.
-    #[must_use]
-    pub fn with_gpu(mut self, device: DeviceAddress) -> Self {
-        self.gpu = Some(device);
-        self
     }
 
     /// Replace the clock the wait deadlines are measured on.
@@ -169,12 +160,6 @@ impl Runtime {
     #[must_use]
     pub const fn journals(&self) -> &Journals {
         &self.journals
-    }
-
-    /// The GPU address the handover steps use, when one is configured.
-    #[must_use]
-    pub const fn gpu(&self) -> Option<&DeviceAddress> {
-        self.gpu.as_ref()
     }
 
     /// One instance's spec, when it is registered.

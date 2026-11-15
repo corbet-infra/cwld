@@ -16,10 +16,10 @@ use cdct::{
     SwitchPlan, TenantState, plan_switch,
 };
 use cdrv::{
-    CpuClaim, DeviceAddress, DeviceFacts, DeviceFilter, Event, EventId, EventLog, EventStream,
-    ExecResult, GuestAgent, GuestExec, GuestHealth, GuestOs, HolderId, HostDevices, HostGpu,
-    HostInstances, InstanceClass, InstanceId, InstanceKind, InstanceSpec, InstanceState, LeaseId,
-    MemoryClaim, Severity, ShutdownMode, Source, StopMode, Subject, Timestamp,
+    CpuClaim, DeviceAddress, DeviceClass, DeviceFacts, DeviceFilter, Event, EventId, EventLog,
+    EventStream, ExecResult, GuestAgent, GuestExec, GuestHealth, GuestOs, HolderId, HostDevices,
+    HostGpu, HostInstances, InstanceClass, InstanceId, InstanceKind, InstanceSpec, InstanceState,
+    LeaseId, MemoryClaim, Severity, ShutdownMode, Source, StopMode, Subject, Timestamp,
 };
 use cwld::{
     CiJob, ClassCatalog, CleanOutcome, Clock, DirtyReason, DiscardHandoff, DiskReset,
@@ -183,6 +183,7 @@ struct FakeHost {
     states: Arc<Mutex<BTreeMap<String, InstanceState>>>,
     events: RefCell<Vec<Event>>,
     calls: RefCell<Vec<String>>,
+    card: RefCell<Vec<DeviceFacts>>,
     fail_prefix: RefCell<Option<String>>,
     destroys: Cell<u32>,
     state_reads: Cell<u32>,
@@ -193,8 +194,15 @@ struct FakeHost {
 }
 
 impl FakeHost {
+    /// A host whose hardware inventory names the fixture card `gpu` with one
+    /// GPU function.
     fn new() -> Self {
-        Self::default()
+        Self::default().with_card(vec![function("gpu", gpu_address(), DeviceClass::Gpu)])
+    }
+
+    fn with_card(self, facts: Vec<DeviceFacts>) -> Self {
+        *self.card.borrow_mut() = facts;
+        self
     }
 
     fn with_state(self, id: &str, state: InstanceState) -> Self {
@@ -398,8 +406,15 @@ fn reported_state(event: &Event) -> Option<InstanceState> {
 }
 
 impl HostDevices for FakeHost {
-    fn enumerate(&self, _filter: DeviceFilter) -> cdrv::Result<Vec<DeviceFacts>> {
-        Ok(Vec::new())
+    fn enumerate(&self, filter: DeviceFilter) -> cdrv::Result<Vec<DeviceFacts>> {
+        Ok(self
+            .card
+            .borrow()
+            .iter()
+            .filter(|facts| filter.class.is_none_or(|class| facts.class == class))
+            .filter(|facts| filter.name.as_ref().is_none_or(|name| &facts.name == name))
+            .cloned()
+            .collect())
     }
 
     fn bind_passthrough(&self, dev: &DeviceAddress) -> cdrv::Result<()> {
@@ -499,6 +514,18 @@ fn gpu_address() -> DeviceAddress {
     }
 }
 
+/// One PCI function of a card, as the hardware inventory reports it.
+fn function(name: &str, address: DeviceAddress, class: DeviceClass) -> DeviceFacts {
+    DeviceFacts {
+        name: name.to_owned(),
+        address: Some(address),
+        vendor: None,
+        class,
+        iommu_group: Some(14),
+        driver: None,
+    }
+}
+
 fn address(dev: DeviceAddress) -> String {
     format!(
         "{:04x}:{:02x}:{:02x}.{}",
@@ -548,7 +575,6 @@ fn runtime(tree: &TempTree) -> Runtime {
 fn runtime_at(tree: &TempTree, now: Timestamp) -> Runtime {
     Runtime::new(tree.path(), ClassCatalog::defaults())
         .expect("the state directory opens")
-        .with_gpu(gpu_address())
         .with_clock(Box::new(FakeClock { now }))
 }
 
@@ -1502,20 +1528,92 @@ fn a_plan_without_its_ports_fails_with_a_typed_error() {
         }
     ));
 
-    // A handover without a GPU address is refused, not invented.
-    let mut bare = Runtime::new(tree.path(), ClassCatalog::defaults())
-        .expect("the state directory opens")
-        .with_clock(Box::new(FakeClock { now: at() }));
-    bare.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
-    let host = FakeHost::new().with_state("mac-desktop", InstanceState::Defined);
+    // A card the hardware inventory does not name is refused, not invented.
+    let host = FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Defined)
+        .with_card(Vec::new());
     let hosts = host_set(&host);
-    let report = bare
+    let report = runtime
         .execute_plan(&plan, &hosts, &mut log, at(), &mut DiscardHandoff)
         .expect("the journal is writable");
     assert!(matches!(
         report.failed.expect("the handover fails").error,
-        StepError::NoGpuDevice
+        StepError::UnknownDevice { ref device } if device == "gpu"
     ));
+    assert!(!host.calls().iter().any(|call| call.starts_with("bind:")));
+}
+
+#[test]
+fn a_handover_resolves_the_card_name_to_every_function() {
+    let tree = TempTree::new("card-functions");
+    let mut runtime = runtime(&tree);
+    let mac = InstanceId::from("mac-desktop");
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let audio = DeviceAddress {
+        domain: 0,
+        bus: 1,
+        slot: 0,
+        function: 1,
+    };
+    let usb = DeviceAddress {
+        domain: 0,
+        bus: 1,
+        slot: 0,
+        function: 2,
+    };
+    let card = || {
+        vec![
+            function("gpu", usb, DeviceClass::Usb),
+            function("gpu", gpu_address(), DeviceClass::Gpu),
+            function("gpu", audio, DeviceClass::Audio),
+        ]
+    };
+    let host = FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Defined)
+        .with_card(card());
+    let hosts = host_set(&host);
+    let mut log = event_log();
+    let report = runtime
+        .execute_plan(&mac_plan(), &hosts, &mut log, at(), &mut DiscardHandoff)
+        .expect("the journal is writable");
+    assert!(report.is_complete());
+    assert_eq!(
+        host.calls(),
+        vec![
+            "tenant-stop:gpu-batch:gpu-besteffort".to_owned(),
+            "tenant-stop:gpu-serving:gpu-interactive".to_owned(),
+            "tenant-stop:desktop-session:gpu-desktop".to_owned(),
+            format!("bind:{}", address(gpu_address())),
+            format!("bind:{}", address(audio)),
+            format!("bind:{}", address(usb)),
+            "start:mac-desktop".to_owned(),
+            "sunshine:guest:mac-desktop".to_owned(),
+        ]
+    );
+
+    // The reverse hands back every function it took, in address order.
+    let host = FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Running)
+        .with_card(card());
+    let hosts = host_set(&host);
+    let report = runtime
+        .execute_plan(&back_plan(&[]), &hosts, &mut log, at(), &mut DiscardHandoff)
+        .expect("the journal is writable");
+    assert!(report.is_complete());
+    assert_eq!(runtime.state(&mac), Some(&InstanceState::Stopped));
+    assert_eq!(
+        host.calls(),
+        vec![
+            "stop:mac-desktop:Clean".to_owned(),
+            format!("unbind:{}", address(gpu_address())),
+            format!("reset:{}", address(gpu_address())),
+            format!("unbind:{}", address(audio)),
+            format!("reset:{}", address(audio)),
+            format!("unbind:{}", address(usb)),
+            format!("reset:{}", address(usb)),
+            "sunshine:host".to_owned(),
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -12,8 +12,8 @@ use std::process::ExitCode;
 
 use cdct::{GpuLadder, KernelOwner, PlanStep, SwitchOutcome, SwitchPlan};
 use cdrv::{
-    DeviceAddress, DeviceFacts, DeviceFilter, EventLog, EventStream, HostDevices, HostGpu,
-    HostInstances, InstanceId, InstanceSpec, InstanceState, Source, StopMode, Timestamp,
+    DeviceAddress, DeviceClass, DeviceFacts, DeviceFilter, EventLog, EventStream, HostDevices,
+    HostGpu, HostInstances, InstanceId, InstanceSpec, InstanceState, Source, StopMode, Timestamp,
 };
 use clap::{Parser, Subcommand};
 use cwld::{ClassCatalog, DiscardHandoff, DiskReset, Hosts, Runtime};
@@ -36,21 +36,17 @@ enum Command {
         /// Print what would be called and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// The GPU address the handover steps would use. The default is a
-        /// synthetic placeholder for a dry run, never a host fact.
-        #[arg(long, default_value = "0000:01:00.0", value_parser = parse_device)]
-        gpu: DeviceAddress,
     },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::RunPlan { plan, dry_run, gpu } => run_plan(&plan, dry_run, gpu),
+        Command::RunPlan { plan, dry_run } => run_plan(&plan, dry_run),
     }
 }
 
-fn run_plan(path: &Path, dry_run: bool, gpu: DeviceAddress) -> ExitCode {
+fn run_plan(path: &Path, dry_run: bool) -> ExitCode {
     if !dry_run {
         eprintln!("cwld: no OS driver is linked in this iteration; only --dry-run is supported");
         return ExitCode::FAILURE;
@@ -63,9 +59,7 @@ fn run_plan(path: &Path, dry_run: bool, gpu: DeviceAddress) -> ExitCode {
         }
     };
     let state = std::env::temp_dir().join(format!("cwld-dry-run-{}", std::process::id()));
-    let runtime =
-        Runtime::new(&state, ClassCatalog::defaults()).map(|runtime| runtime.with_gpu(gpu));
-    let mut runtime = match runtime {
+    let mut runtime = match Runtime::new(&state, ClassCatalog::defaults()) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("cwld: cannot open the dry-run state directory: {error}");
@@ -148,7 +142,9 @@ fn step_line(step: &PlanStep) -> String {
         PlanStep::StopInstance { instance, mode } => {
             format!("stop instance {instance} ({mode:?})")
         }
-        PlanStep::HandOverCard { from, to } => format!("hand over the card: {from} -> {to}"),
+        PlanStep::HandOverCard { device, from, to } => {
+            format!("hand the card {device} over: {from} -> {to}")
+        }
         PlanStep::StartInstance { instance } => format!("start instance {instance}"),
         PlanStep::StartHostTenant { tenant, ladder } => {
             format!("start host tenant {tenant} ({ladder})")
@@ -157,30 +153,16 @@ fn step_line(step: &PlanStep) -> String {
     }
 }
 
-fn parse_device(value: &str) -> Result<DeviceAddress, String> {
-    let (head, function) = value
-        .rsplit_once('.')
-        .ok_or_else(|| format!("GPU address must be domain:bus:slot.function, got {value:?}"))?;
-    let fields: Vec<&str> = head.split(':').collect();
-    if fields.len() != 3 {
-        return Err(format!(
-            "GPU address must be domain:bus:slot.function, got {value:?}"
-        ));
-    }
-    let parse = |text: &str, what: &str| {
-        u16::from_str_radix(text, 16)
-            .map_err(|_| format!("GPU address {what} is not hexadecimal: {text:?}"))
-    };
-    Ok(DeviceAddress {
-        domain: parse(fields[0], "domain")?,
-        bus: u8::try_from(parse(fields[1], "bus")?)
-            .map_err(|_| format!("GPU bus does not fit in a byte: {:?}", fields[1]))?,
-        slot: u8::try_from(parse(fields[2], "slot")?)
-            .map_err(|_| format!("GPU slot does not fit in a byte: {:?}", fields[2]))?,
-        function: u8::try_from(parse(function, "function")?)
-            .map_err(|_| format!("GPU function does not fit in a byte: {function:?}"))?,
-    })
-}
+/// A synthetic PCI function the dry run resolves the card's name to.
+///
+/// A dry run never reads the host's hardware inventory, so it answers with one
+/// placeholder function; it is printed, never used.
+const SYNTHETIC_GPU: DeviceAddress = DeviceAddress {
+    domain: 0,
+    bus: 1,
+    slot: 0,
+    function: 0,
+};
 
 /// A fake host that prints every call it would make.
 struct LoggingHost {
@@ -260,7 +242,17 @@ impl HostInstances for LoggingHost {
 impl HostDevices for LoggingHost {
     fn enumerate(&self, filter: DeviceFilter) -> cdrv::Result<Vec<DeviceFacts>> {
         self.log(&format!("enumerate({filter:?})"));
-        Ok(Vec::new())
+        let Some(name) = filter.name else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![DeviceFacts {
+            name,
+            address: Some(SYNTHETIC_GPU),
+            vendor: None,
+            class: DeviceClass::Gpu,
+            iommu_group: None,
+            driver: None,
+        }])
     }
 
     fn bind_passthrough(&self, dev: &DeviceAddress) -> cdrv::Result<()> {

@@ -14,8 +14,8 @@
 
 use cdct::{KernelOwner, PlanStep, SwitchPlan};
 use cdrv::{
-    Event, EventLog, HostDevices, HostGpu, HostInstances, InstanceId, Severity, StopMode, Subject,
-    Timestamp,
+    DeviceAddress, DeviceFilter, Event, EventLog, HostDevices, HostGpu, HostInstances, InstanceId,
+    Severity, StopMode, Subject, Timestamp,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -134,9 +134,12 @@ pub enum StepError {
         /// What went wrong.
         message: String,
     },
-    /// A handover step ran without a GPU address configured.
-    #[error("no GPU device address is configured for the handover")]
-    NoGpuDevice,
+    /// The hardware inventory names no PCI function for the card.
+    #[error("the hardware inventory names no PCI functions for the card {device:?}")]
+    UnknownDevice {
+        /// The card's inventory name, from the plan.
+        device: String,
+    },
     /// A dirty mark or a plan journal could not be written.
     #[error("state store: {0}")]
     Store(String),
@@ -331,7 +334,7 @@ impl Runtime {
                 }
                 self.stop_instance(instance, hosts, log, at, events)
             }
-            PlanStep::HandOverCard { from, to } => self.hand_over(from, to, hosts),
+            PlanStep::HandOverCard { device, from, to } => hand_over(device, from, to, hosts),
             PlanStep::StartInstance { instance } => {
                 self.start_instance(instance, hosts, log, at, events)
             }
@@ -347,26 +350,36 @@ impl Runtime {
             }
         }
     }
+}
 
-    fn hand_over(
-        &self,
-        from: &KernelOwner,
-        to: &KernelOwner,
-        hosts: &Hosts<'_>,
-    ) -> Result<(), StepError> {
-        let device = self.gpu().copied().ok_or(StepError::NoGpuDevice)?;
-        let label = device_label(device);
+/// Hand the card the plan names over between kernels.
+///
+/// The plan names the card as the hardware inventory does; the inventory
+/// resolves that name to every PCI function the card presents (a graphics card
+/// is its GPU function plus the audio and USB functions beside it). Each
+/// function is unbound and reset when the card leaves a guest, and bound when
+/// it goes to one. A name that resolves to nothing is a typed error, never a
+/// guessed address.
+fn hand_over(
+    device: &str,
+    from: &KernelOwner,
+    to: &KernelOwner,
+    hosts: &Hosts<'_>,
+) -> Result<(), StepError> {
+    let functions = card_functions(device, hosts)?;
+    for address in &functions {
+        let label = device_label(*address);
         if from.guest().is_some() {
             hosts
                 .devices
-                .unbind_passthrough(&device)
+                .unbind_passthrough(address)
                 .map_err(|error| StepError::Driver {
                     action: format!("unbind {label} from passthrough"),
                     message: error.to_string(),
                 })?;
             hosts
                 .devices
-                .reset(&device)
+                .reset(address)
                 .map_err(|error| StepError::Driver {
                     action: format!("reset {label}"),
                     message: error.to_string(),
@@ -375,17 +388,42 @@ impl Runtime {
         if to.guest().is_some() {
             hosts
                 .devices
-                .bind_passthrough(&device)
+                .bind_passthrough(address)
                 .map_err(|error| StepError::Driver {
                     action: format!("bind {label} to passthrough"),
                     message: error.to_string(),
                 })?;
         }
-        Ok(())
     }
+    Ok(())
 }
 
-fn device_label(device: cdrv::DeviceAddress) -> String {
+/// Resolve a card's inventory name to the PCI functions it presents.
+fn card_functions(device: &str, hosts: &Hosts<'_>) -> Result<Vec<DeviceAddress>, StepError> {
+    let filter = DeviceFilter {
+        class: None,
+        name: Some(device.to_owned()),
+    };
+    let facts = hosts
+        .devices
+        .enumerate(filter)
+        .map_err(|error| StepError::Driver {
+            action: format!("enumerate the functions of {device}"),
+            message: error.to_string(),
+        })?;
+    let mut addresses: Vec<DeviceAddress> =
+        facts.iter().filter_map(|facts| facts.address).collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(StepError::UnknownDevice {
+            device: device.to_owned(),
+        });
+    }
+    Ok(addresses)
+}
+
+fn device_label(device: DeviceAddress) -> String {
     format!(
         "{:04x}:{:02x}:{:02x}.{}",
         device.domain, device.bus, device.slot, device.function
