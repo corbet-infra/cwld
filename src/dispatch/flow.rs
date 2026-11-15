@@ -23,6 +23,9 @@ use super::admission::{Admission, Admit};
 use super::exec::{Assignment, ExecError, Executor, JobRef, RunOutcome};
 use super::forge::{Forge, Registration, Scope, WaitingJob};
 
+/// Waiting-job listings in flight at once (today's dispatcher uses eight).
+const LISTING_THREADS: usize = 8;
+
 /// Builds the executor of one slot (by slot id).
 pub type ExecutorFactory = Arc<dyn Fn(&str) -> Box<dyn Executor> + Send + Sync>;
 
@@ -278,14 +281,31 @@ impl Dispatcher {
             .map(|p| p.label.clone())
             .collect();
         let scopes = inner.scopes(now)?;
+        // one listing per scope, a few at a time (every listing is one HTTP request)
         let mut jobs: Vec<(Scope, WaitingJob)> = Vec::new();
-        for scope in &scopes {
-            match inner.forge.waiting_jobs(scope, &labels) {
-                Ok(found) => jobs.extend(found.into_iter().map(|j| (scope.clone(), j))),
-                Err(e) => inner.say(
-                    "jobs-failed",
-                    &[("scope", scope.to_string()), ("error", e.to_string())],
-                ),
+        for chunk in scopes.chunks(LISTING_THREADS) {
+            let answers: Vec<_> = std::thread::scope(|s| {
+                let workers: Vec<_> = chunk
+                    .iter()
+                    .map(|scope| s.spawn(|| inner.forge.waiting_jobs(scope, &labels)))
+                    .collect();
+                workers.into_iter().map(|w| w.join()).collect()
+            });
+            for (scope, answer) in chunk.iter().zip(answers) {
+                match answer {
+                    Ok(Ok(found)) => jobs.extend(found.into_iter().map(|j| (scope.clone(), j))),
+                    Ok(Err(e)) => inner.say(
+                        "jobs-failed",
+                        &[("scope", scope.to_string()), ("error", e.to_string())],
+                    ),
+                    Err(_) => inner.say(
+                        "jobs-failed",
+                        &[
+                            ("scope", scope.to_string()),
+                            ("error", "listing panicked".to_owned()),
+                        ],
+                    ),
+                }
             }
         }
         jobs.sort_by_key(|(_, j)| j.id);
@@ -297,6 +317,9 @@ impl Dispatcher {
             }
         }
         for (scope, job) in jobs {
+            if lock(&inner.state).stopping {
+                break; // a drain began during this pass: nothing new
+            }
             let Some((pool_idx, slot)) = inner.choose(&scope, &job) else {
                 continue;
             };

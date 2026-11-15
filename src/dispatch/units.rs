@@ -25,6 +25,9 @@ pub struct UnitSpec {
     /// Unit properties from the deployment (`User=`, `Delegate=yes`,
     /// `ProtectProc=`, `LoadCredential=`, ...). cwld knows no sandbox detail.
     pub properties: Vec<String>,
+    /// The job's environment (`NAME`, value). Paths and ports, never a secret:
+    /// they travel in an argument list.
+    pub environment: Vec<(String, String)>,
 }
 
 /// One event of a running unit's output.
@@ -63,6 +66,12 @@ pub trait UnitRunner: Send + Sync {
     fn kill_all(&self, unit: &str) -> io::Result<()>;
     /// Whether the unit and its cgroup are gone.
     fn gone(&self, unit: &str) -> bool;
+    /// End every leftover unit whose name starts with `prefix` (what a crashed
+    /// predecessor left); returns their names.
+    ///
+    /// # Errors
+    /// The list could not be read.
+    fn sweep(&self, prefix: &str) -> io::Result<Vec<String>>;
 }
 
 /// Units through `systemd-run` (interim adapter).
@@ -121,9 +130,24 @@ impl RunningUnit for Piped {
 
 fn pump(stream: impl Read + Send + 'static, tx: mpsc::Sender<String>) {
     std::thread::spawn(move || {
-        for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
+        // Bytes, not `lines()`: a line that is not UTF-8 must not end the pump
+        // (the unit would then block on a full pipe and the cancel line would
+        // never be seen).
+        let mut reader = BufReader::new(stream);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&buf);
+                    if tx
+                        .send(text.trim_end_matches(['\n', '\r']).to_owned())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -137,6 +161,9 @@ impl UnitRunner for SystemdRun {
             .arg(format!("--working-directory={}", spec.workdir.display()));
         for property in &spec.properties {
             cmd.arg(format!("--property={property}"));
+        }
+        for (name, value) in &spec.environment {
+            cmd.arg(format!("--setenv={name}={value}"));
         }
         cmd.arg("--").args(&spec.argv);
         let mut child = cmd
@@ -165,5 +192,21 @@ impl UnitRunner for SystemdRun {
 
     fn gone(&self, unit: &str) -> bool {
         !self.cgroup(unit).exists()
+    }
+
+    fn sweep(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let dir = self.cgroup_root.join(&self.slice);
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(unit) = name.strip_suffix(".service")
+                && unit.starts_with(prefix)
+            {
+                self.kill_all(unit)?;
+                found.push(unit.to_owned());
+            }
+        }
+        found.sort();
+        Ok(found)
     }
 }

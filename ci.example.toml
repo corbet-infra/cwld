@@ -19,5 +19,11 @@ claim_mib = 2048
 pickup_s = 20
 runner = "/run/current-system/sw/bin/forgejo-runner"
 template = "/etc/cwld-ci/runner.json"
-properties = ["User=forgejo-runner", "Delegate=yes", "ProtectProc=invisible", "MemoryMax=infinity"]
-slots = [{ id = "0", name = "srv-0" }, { id = "1", name = "srv-1" }]
+run_as = "forgejo-runner"      # User= of every job unit; the job directories are handed to it
+properties = ["Delegate=yes", "ProtectProc=invisible", "MemoryMax=infinity"]
+# the job's environment, one declaration for every slot; {credentials} is the job unit's own credentials directory
+environment = { HOME = "/var/lib/forgejo-runner", AWS_SHARED_CREDENTIALS_FILE = "{credentials}/sccache-aws" }
+slots = [
+  { id = "0", name = "srv-0", environment = { SCCACHE_SERVER_PORT = "4230" } },
+  { id = "1", name = "srv-1", environment = { SCCACHE_SERVER_PORT = "4231" } },
+]

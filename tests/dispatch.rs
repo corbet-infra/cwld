@@ -282,6 +282,9 @@ impl UnitRunner for FakeUnits {
         st.gone_calls += 1;
         st.gone_calls > self.stubborn
     }
+    fn sweep(&self, _prefix: &str) -> std::io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 fn settings(dir: &std::path::Path, pickup_ms: u64) -> HostSettings {
@@ -292,6 +295,16 @@ fn settings(dir: &std::path::Path, pickup_ms: u64) -> HostSettings {
         cache_dir: dir.join("cache"),
         pickup: Duration::from_millis(pickup_ms),
         properties: vec!["Delegate=yes".to_owned(), "User=jobs".to_owned()],
+        environment: vec![
+            ("HOME".to_owned(), "/var/lib/jobs".to_owned()),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE".to_owned(),
+                "{credentials}/sccache-aws".to_owned(),
+            ),
+            ("SCCACHE_SERVER_PORT".to_owned(), "1".to_owned()),
+        ],
+        slot_environment: vec![("SCCACHE_SERVER_PORT".to_owned(), "4230".to_owned())],
+        owner: None,
         credentials_root: PathBuf::from("/run/credentials"),
         kill_rounds: 5,
         kill_pause: Duration::from_millis(1),
@@ -422,6 +435,26 @@ fn a_job_runs_in_a_fresh_unit_and_leaves_nothing() {
     assert!(
         spec.properties.contains(&"Delegate=yes".to_owned()),
         "the deployment's properties reach the unit"
+    );
+    // the job's environment: the pool's values, the slot's override, the unit's credentials directory
+    let env = |n: &str| {
+        spec.environment
+            .iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(env("HOME").as_deref(), Some("/var/lib/jobs"));
+    assert_eq!(env("SCCACHE_SERVER_PORT").as_deref(), Some("4230"));
+    assert_eq!(
+        env("AWS_SHARED_CREDENTIALS_FILE"),
+        Some(format!(
+            "/run/credentials/cwld-ci-0-{HANDLE_A}.service/sccache-aws"
+        ))
+    );
+    assert_eq!(
+        spec.environment.len(),
+        3,
+        "an override replaces, it does not repeat"
     );
     // the single-use token is a 0600 credential file, in no argument and no log line
     assert_eq!(
@@ -1318,4 +1351,107 @@ fn a_line_break_in_a_header_is_refused_before_curl_runs() {
     })
     .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+// --- review fixes ------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn output_that_is_not_utf8_neither_ends_the_stream_nor_hides_the_cancel_line() {
+    use cwld::dispatch::units::SystemdRun;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp("fake-systemd-run");
+    let script = dir.join("systemd-run");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'bad \\377\\376 bytes\\n'\nprintf 'unauthenticated: unregistered runner\\n'\n",
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let runner = SystemdRun {
+        systemd_run: script.display().to_string(),
+        ..SystemdRun::default()
+    };
+    let spec = UnitSpec {
+        unit: "cwld-ci-0-x".to_owned(),
+        argv: vec!["true".to_owned()],
+        workdir: dir.clone(),
+        properties: Vec::new(),
+        environment: Vec::new(),
+    };
+    let mut unit = runner.start(&spec).expect("start");
+    let mut lines = Vec::new();
+    while let UnitEvent::Line(l) = unit.next(Duration::from_secs(5)) {
+        lines.push(l);
+    }
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("bad "));
+    assert!(cwld::dispatch::cancel::is_cancel_line(&lines[1]));
+}
+
+#[test]
+fn a_sweep_ends_the_leftover_units_of_a_dead_predecessor_only() {
+    use cwld::dispatch::units::SystemdRun;
+    let root = temp("cgroups");
+    let slice = root.join("system.slice");
+    for name in [
+        "cwld-ci-0-aaaa.service",
+        "cwld-ci-1-bbbb.service",
+        "sshd.service",
+    ] {
+        std::fs::create_dir_all(slice.join(name)).expect("cgroup");
+        std::fs::write(slice.join(name).join("cgroup.kill"), "").expect("kill file");
+    }
+    let runner = SystemdRun {
+        cgroup_root: root,
+        ..SystemdRun::default()
+    };
+    let swept = runner.sweep("cwld-ci-").expect("sweep");
+    assert_eq!(swept, ["cwld-ci-0-aaaa", "cwld-ci-1-bbbb"]);
+    assert_eq!(
+        std::fs::read_to_string(slice.join("cwld-ci-0-aaaa.service/cgroup.kill")).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(slice.join("sshd.service/cgroup.kill")).unwrap(),
+        ""
+    );
+}
+
+#[test]
+fn the_runner_account_is_read_from_passwd_and_a_double_user_is_refused() {
+    use cwld::dispatch::config::account_ids;
+    let dir = temp("passwd");
+    let passwd = dir.join("passwd");
+    std::fs::write(
+        &passwd,
+        "root:x:0:0::/root:/bin/sh\nforgejo-runner:x:995:994::/var/lib/forgejo-runner:/bin/false\n",
+    )
+    .unwrap();
+    assert_eq!(account_ids(&passwd, "forgejo-runner").unwrap(), (995, 994));
+    assert!(account_ids(&passwd, "nobody-here").is_err());
+    let base = r#"
+state_dir = "/var/lib/cwld-ci"
+[forge]
+api = "https://forge.example/api/v1"
+runner_url = "https://forge.example/"
+runner_version = "v13.1.0"
+[[pool]]
+label = "linux"
+kind = "host"
+claim_mib = 2048
+runner = "/bin/forgejo-runner"
+template = "/etc/runner.json"
+run_as = "forgejo-runner"
+environment = { HOME = "/var/lib/forgejo-runner" }
+slots = [{ id = "0", name = "srv-0", environment = { SCCACHE_SERVER_PORT = "4230" } }]
+"#;
+    assert!(CiConfig::parse(base).is_ok());
+    assert!(
+        CiConfig::parse(&base.replace(
+            "run_as = \"forgejo-runner\"",
+            "run_as = \"forgejo-runner\"\nproperties = [\"User=x\"]"
+        ))
+        .is_err()
+    );
+    assert!(CiConfig::parse(&base.replace("HOME =", "\"1BAD\" =")).is_err());
 }

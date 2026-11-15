@@ -132,6 +132,15 @@ pub struct HostSettings {
     pub pickup: Duration,
     /// Unit properties from the deployment.
     pub properties: Vec<String>,
+    /// The job's environment, shared by every slot of the pool. A value may
+    /// hold `{unit}`, `{slot}`, `{job_dir}` and `{credentials}` (the unit's
+    /// credentials directory).
+    pub environment: Vec<(String, String)>,
+    /// This slot's own environment values (they replace the pool's by name).
+    pub slot_environment: Vec<(String, String)>,
+    /// The account the runner process runs as (uid, gid): the job directories
+    /// are handed to it, because the dispatcher itself is not that account.
+    pub owner: Option<(u32, u32)>,
     /// Where systemd exposes a unit's credentials (`/run/credentials`).
     pub credentials_root: PathBuf,
     /// Kill rounds before a teardown gives up.
@@ -182,6 +191,32 @@ impl HostExecutor {
         cfg
     }
 
+    /// The job's environment with the placeholders filled in.
+    fn environment(&self, unit: &str, job_dir: &Path) -> Vec<(String, String)> {
+        let credentials = format!("{}/{unit}.service", self.cfg.credentials_root.display());
+        let fill = |value: &str| {
+            value
+                .replace("{unit}", unit)
+                .replace("{slot}", &self.slot)
+                .replace("{job_dir}", &job_dir.display().to_string())
+                .replace("{credentials}", &credentials)
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (name, value) in self
+            .cfg
+            .environment
+            .iter()
+            .chain(&self.cfg.slot_environment)
+        {
+            let value = fill(value);
+            match out.iter_mut().find(|(n, _)| n == name) {
+                Some(entry) => entry.1 = value,
+                None => out.push((name.clone(), value)),
+            }
+        }
+        out
+    }
+
     fn workdir_started(work: &Path) -> bool {
         fs::read_dir(work).is_ok_and(|mut d| d.next().is_some())
     }
@@ -202,8 +237,20 @@ impl Executor for HostExecutor {
             }
         }
         let dir = self.slot_dir().join(format!("job.{}", job.handle));
+        let cache = self.cfg.cache_dir.join(&self.slot);
         fs::create_dir_all(dir.join("work")).map_err(|e| fail(e.to_string()))?;
-        fs::create_dir_all(self.cfg.cache_dir.join(&self.slot)).map_err(|e| fail(e.to_string()))?;
+        fs::create_dir_all(&cache).map_err(|e| fail(e.to_string()))?;
+        if let Some((uid, gid)) = self.cfg.owner {
+            // the job's directory and its work directory belong to the runner's account; the
+            // credential file and the configuration inside stay the dispatcher's
+            for path in [dir.join("work"), cache] {
+                std::os::unix::fs::chown(&path, Some(uid), Some(gid)).map_err(|e| {
+                    fail(format!("cannot hand {} to the runner: {e}", path.display()))
+                })?;
+            }
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o711))
+                .map_err(|e| fail(e.to_string()))?;
+        }
         self.job_dir = Some(dir);
         self.unit = Some(format!("cwld-ci-{}-{}", self.slot, job.handle));
         Ok(())
@@ -243,6 +290,7 @@ impl Executor for HostExecutor {
             ],
             workdir: dir.clone(),
             properties,
+            environment: self.environment(&unit, &dir),
         };
         let mut running = match self.units.start(&spec) {
             Ok(r) => r,
@@ -264,6 +312,14 @@ impl Executor for HostExecutor {
                     if !cancelled && is_cancel_line(&line) {
                         cancelled = true;
                         let _ = self.units.kill_all(&unit);
+                    } else if !picked && !no_task && Instant::now() >= deadline {
+                        // a chatty runner must not push the pickup check back for ever
+                        if Self::workdir_started(&work) {
+                            picked = true;
+                        } else {
+                            no_task = true;
+                            let _ = self.units.kill_all(&unit);
+                        }
                     }
                 }
                 UnitEvent::Timeout if !picked && !no_task => {

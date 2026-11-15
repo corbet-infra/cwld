@@ -92,3 +92,12 @@ The URLs must carry the commits the code is written against.
 ## License
 
 `LGPL-3.0-only WITH LGPL-3.0-linking-exception`; see `LICENSE`.
+
+## `cwld ci`: decisions of the review (2026-11-15)
+
+| Question | Decision | Why |
+|---|---|---|
+| HTTP client | keep `curl` (config on stdin) | an in-process rustls client needs `rustls-webpki` and `untrusted` (ISC), `ring` (Apache-2.0 AND ISC) and `subtle` (BSD-3-Clause); none is on the `deny.toml` allowlist (MIT, Apache-2.0, Unicode-3.0, and MPL-2.0 for dependencies since 2026-11-14), and MPL-2.0 does not help. Adding ISC and BSD-3-Clause is the owner's licence decision. curl also honours the host trust store (`SSL_CERT_FILE`). The cost is one TLS handshake per request; the listings run eight at a time, as in today's dispatcher |
+| systemd | keep `systemd-run --pipe --wait` behind `UnitRunner` | the whole point of the call is the unit's output stream (the cancel line is an output line). `StartTransientUnit` over zbus returns a job, not the stream: it needs fd passing or the journal, plus an async runtime and `zvariant`. That is not a contained change; the trait keeps the swap to one file |
+| Account | the dispatcher runs as root in a sandboxed unit of its own | starting a system unit needs polkit authority equal to root, `cgroup.kill` of a unit owned by the runner account is not writable by a third account, and the job tree (owned by the runner account) cannot be removed by a third account. Jobs still never see the mint credential: they run as `run_as` under `ProtectProc=invisible` |
+| Job environment | `environment` per pool, `environment` per slot (sccache port) | the transient unit inherits nothing from the dispatcher; `{credentials}` is the job unit's own credentials directory |
