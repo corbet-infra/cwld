@@ -157,6 +157,18 @@ fn windows_plan() -> SwitchPlan {
     }
 }
 
+/// The plan's displaced tenants with the count the fake driver reports by
+/// default (1) in place of the planner's placeholder (0).
+fn counted(plan: &SwitchPlan) -> Vec<DisplacedTenant> {
+    plan.displaced
+        .iter()
+        .map(|tenant| DisplacedTenant {
+            replicas: 1,
+            ..tenant.clone()
+        })
+        .collect()
+}
+
 fn back_plan(displaced: &[DisplacedTenant]) -> SwitchPlan {
     let outcome = plan_switch(
         &KernelOwner::Host,
@@ -1211,6 +1223,89 @@ fn a_tenant_at_zero_replicas_is_neither_stopped_nor_restored() {
 }
 
 #[test]
+fn a_failed_restore_still_restores_every_other_tenant() {
+    let tree = TempTree::new("restore-all");
+    let mut runtime = runtime(&tree);
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let host = FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Running)
+        .failing("tenant-start:desktop-session");
+    let hosts = host_set(&host);
+    let displaced = vec![
+        DisplacedTenant {
+            tenant: "desktop-session".to_owned(),
+            ladder: GpuLadder::Desktop,
+            replicas: 1,
+        },
+        DisplacedTenant {
+            tenant: "gpu-serving".to_owned(),
+            ladder: GpuLadder::Interactive,
+            replicas: 2,
+        },
+    ];
+    let report = runtime
+        .execute_plan(
+            &back_plan(&displaced),
+            &hosts,
+            &mut event_log(),
+            at(),
+            &mut DiscardHandoff,
+        )
+        .expect("the journal is writable");
+    let failed = report.failed.as_ref().expect("the desktop start fails");
+    assert!(
+        matches!(&failed.step, PlanStep::StartHostTenant { tenant, .. } if tenant == "desktop-session")
+    );
+    assert!(
+        report.not_run.is_empty(),
+        "every restore ran: {:?}",
+        report.not_run
+    );
+    let calls = host.calls();
+    assert!(
+        calls.contains(&"tenant-start:gpu-serving:gpu-interactive:x2".to_owned()),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&"sunshine:host".to_owned()), "{calls:?}");
+}
+
+#[test]
+fn a_failure_before_the_card_is_back_stops_the_return() {
+    let tree = TempTree::new("return-stops");
+    let mut runtime = runtime(&tree);
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let host = FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Running)
+        .failing("unbind:");
+    let hosts = host_set(&host);
+    let displaced = vec![DisplacedTenant {
+        tenant: "gpu-serving".to_owned(),
+        ladder: GpuLadder::Interactive,
+        replicas: 2,
+    }];
+    let report = runtime
+        .execute_plan(
+            &back_plan(&displaced),
+            &hosts,
+            &mut event_log(),
+            at(),
+            &mut DiscardHandoff,
+        )
+        .expect("the journal is writable");
+    assert!(matches!(
+        report.failed.as_ref().map(|f| &f.step),
+        Some(PlanStep::HandOverCard { .. })
+    ));
+    assert!(
+        !host
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("tenant-start:"))
+    );
+    assert!(!report.not_run.is_empty());
+}
+
+#[test]
 fn a_stop_with_no_event_at_all_ends_at_the_deadline() {
     // A guest that ignores the stop request pushes nothing: the wait must
     // still end, as a stop timeout, without a destroy.
@@ -1436,9 +1531,10 @@ fn a_full_mac_switch_hands_over_the_card_and_records_what_it_displaced() {
         .expect("the holder table reads")
         .expect("the holder table exists");
     assert_eq!(table.gpu_owner, KernelOwner::Guest(target.clone()));
+    // The planner's placeholders (0) carry the live counts the driver reported (1).
     assert_eq!(
         table.displaced_by_card_custodian(),
-        plan.displaced.as_slice()
+        counted(&plan).as_slice()
     );
 
     // The reverse plan restores exactly that set, in ladder order.
@@ -1506,10 +1602,7 @@ fn a_windows_switch_stops_the_office_profile_first() {
     assert!(report.is_complete());
     assert_eq!(report.handoff, HandoffStatus::Recorded);
     // once before the first tenant is stopped (with the live counts), once after the plan
-    assert_eq!(
-        handoff.recorded,
-        vec![plan.displaced.clone(), plan.displaced.clone()]
-    );
+    assert_eq!(handoff.recorded, vec![counted(&plan), counted(&plan)]);
 
     let calls = host.calls();
     let office_stop = calls
@@ -1633,8 +1726,8 @@ fn a_readiness_timeout_fails_the_start() {
     assert_eq!(host.destroys.get(), 0);
     assert_eq!(
         host.state_reads.get(),
-        2,
-        "one observation and one read before the stream; the wait never polls"
+        3,
+        "one observation, one read before the stream and one right after subscribing; the wait never polls"
     );
 }
 
@@ -1669,8 +1762,8 @@ fn a_start_follows_the_pushed_events_and_reads_the_state_once() {
     assert_eq!(host.calls(), vec!["start:mac-desktop".to_owned()]);
     assert_eq!(
         host.state_reads.get(),
-        2,
-        "the state is read once for the observation and once before the stream"
+        3,
+        "the state is read for the observation, before the stream and once right after subscribing"
     );
 }
 
@@ -1707,7 +1800,7 @@ fn a_driver_failure_event_fails_the_start() {
         runtime.state(&mac),
         Some(&InstanceState::Failed("the guest did not boot".to_owned()))
     );
-    assert_eq!(host.state_reads.get(), 2);
+    assert_eq!(host.state_reads.get(), 3);
 }
 
 #[test]
@@ -1817,8 +1910,8 @@ fn a_stop_timeout_ends_failed_and_never_destroys() {
     assert!(!host.calls().iter().any(|call| call.starts_with("unbind:")));
     assert_eq!(
         host.state_reads.get(),
-        2,
-        "the stop wait follows events, it does not poll the state"
+        3,
+        "the stop wait follows events (one read closes the subscription gap); it does not poll the state"
     );
 }
 

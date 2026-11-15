@@ -83,7 +83,11 @@ libvirt, sysfs, `modprobe`, the systemd manager that owns the desktop session
 (a container's own system bus when the session runs in one, resolved from the
 container's init pid at that moment), and Kubernetes. The live replica counts
 of the displaced tenants are recorded through the conductor
-(`record_displaced`), the table's one writer.
+(`record_displaced`), the table's one writer, and a plan that ran to its end is
+reported (`completed`): a return to the host releases the guest's holder only
+then, so a return that failed is planned again by the next `cdct switch linux`.
+Once the card is back on the host, a tenant that fails to start does not stop
+the others: every remaining restore runs and each failure is reported.
 
 The host file is deployment data (JSON): `host`, `conductor` (socket),
 `state_dir`, `classes` (optional class file), `libvirt_uri`, `inventory` (the

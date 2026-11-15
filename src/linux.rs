@@ -310,6 +310,24 @@ fn report(report: &PlanReport) {
     }
 }
 
+/// Tell the conductor a plan ran to its end. A return to the host releases the
+/// guest's holder only now; an incomplete plan is not reported, so the next
+/// `cdct switch` plans it again.
+fn complete(conductor: &Path, plan: &SwitchPlan) {
+    let outcome = Client::connect(&Endpoint::LocalSocket(conductor.to_path_buf()))
+        .and_then(|mut client| client.completed(&plan.target));
+    match outcome {
+        Ok(owner) => println!(
+            "cwld: reported the plan to {} complete; the card's owner is {owner}",
+            plan.target
+        ),
+        Err(error) => eprintln!(
+            "cwld: the plan to {} completed, but the conductor did not take the report: {error}",
+            plan.target
+        ),
+    }
+}
+
 /// Follow the conductor: run every plan it grants, until its stream ends.
 ///
 /// # Errors
@@ -379,7 +397,12 @@ pub fn follow(path: &Path) -> Result<(), String> {
             );
             busy.store(true, Ordering::SeqCst);
             match execute(&mut runtime, &config, &plan) {
-                Ok(done) => report(&done),
+                Ok(done) => {
+                    report(&done);
+                    if done.is_complete() {
+                        complete(&config.conductor, &plan);
+                    }
+                }
                 Err(message) => eprintln!(
                     "cwld: the plan to {} was NOT started: {message}",
                     plan.target

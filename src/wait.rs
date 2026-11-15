@@ -166,12 +166,30 @@ pub(crate) fn wait_for(
             }
         }
     });
+    // The transition may have happened between the first read and the
+    // subscription: one more read closes that gap. At the deadline the state
+    // is read once more for the same reason (an event the source missed).
+    let read_ready = || -> Result<Option<InstanceState>, WaitError> {
+        let now = instances
+            .state(instance)
+            .map_err(|error| WaitError::Driver {
+                instance: instance.clone(),
+                message: error.to_string(),
+            })?;
+        Ok(ready(&now).then_some(now))
+    };
+    if let Some(state) = read_ready()? {
+        return Ok(state);
+    }
     let mut last = observed;
     loop {
         let left = deadline.saturating_sub(clock.now().as_millis());
         let event = match receiver.recv_timeout(Duration::from_millis(left)) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => {
+                if let Some(state) = read_ready()? {
+                    return Ok(state);
+                }
                 return Err(WaitError::Timeout {
                     instance: instance.clone(),
                     want,

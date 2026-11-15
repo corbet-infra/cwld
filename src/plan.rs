@@ -274,19 +274,36 @@ impl Runtime {
                 }
                 Err(error) => {
                     events.append(&mut step_events);
+                    events.push(step_failed(log, at, &plan.target, index, step, &error));
+                    // Once the card is back on the host, one tenant that fails to
+                    // start must not leave the others down: every remaining
+                    // restore still runs, and each failure is reported. Before
+                    // that point the plan stops at the first failure.
+                    let mut not_run = plan.steps[index + 1..].to_vec();
+                    if plan.target.is_host() && is_restore(step) {
+                        for (later_index, later) in plan.steps.iter().enumerate().skip(index + 1) {
+                            self.journals().before_step(&mut journal, later_index)?;
+                            let mut later_events = Vec::new();
+                            let outcome = self.run_step(later, hosts, log, at, &mut later_events);
+                            events.append(&mut later_events);
+                            match outcome {
+                                Ok(()) => {
+                                    self.journals().after_step(&mut journal, later_index)?;
+                                    executed.push(later.clone());
+                                }
+                                Err(later_error) => events.push(step_failed(
+                                    log,
+                                    at,
+                                    &plan.target,
+                                    later_index,
+                                    later,
+                                    &later_error,
+                                )),
+                            }
+                        }
+                        not_run.clear();
+                    }
                     self.journals().finish(&journal)?;
-                    events.push(log.emit(
-                        at,
-                        "plan.step_failed",
-                        Subject::Host,
-                        Severity::Error,
-                        json!({
-                            "target": plan.target,
-                            "index": index,
-                            "step": step,
-                            "error": error.to_string(),
-                        }),
-                    ));
                     return Ok(PlanReport {
                         target: plan.target.clone(),
                         executed,
@@ -295,7 +312,7 @@ impl Runtime {
                             step: step.clone(),
                             error,
                         }),
-                        not_run: plan.steps[index + 1..].to_vec(),
+                        not_run,
                         handoff: HandoffStatus::NotAttempted,
                         events,
                     });
@@ -438,6 +455,36 @@ impl Runtime {
             }
         }
     }
+}
+
+/// Whether a step restores the host after the card is back on it.
+const fn is_restore(step: &PlanStep) -> bool {
+    matches!(
+        step,
+        PlanStep::StartHostTenant { .. } | PlanStep::SunshineFollows { .. }
+    )
+}
+
+fn step_failed(
+    log: &mut EventLog,
+    at: Timestamp,
+    target: &KernelOwner,
+    index: usize,
+    step: &PlanStep,
+    error: &StepError,
+) -> Event {
+    log.emit(
+        at,
+        "plan.step_failed",
+        Subject::Host,
+        Severity::Error,
+        json!({
+            "target": target,
+            "index": index,
+            "step": step,
+            "error": error.to_string(),
+        }),
+    )
 }
 
 /// Hand the card the plan names over between kernels.
