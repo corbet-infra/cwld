@@ -167,6 +167,7 @@ impl UnitRunner for SystemdRun {
         let mut cmd = Command::new(&self.systemd_run);
         cmd.arg(format!("--unit={}", spec.unit))
             .args(["--system", "--no-ask-password"])
+            .arg(format!("--slice={}", self.slice))
             .args(["--collect", "--pipe", "--wait", "--quiet"])
             .arg(format!("--working-directory={}", spec.workdir.display()));
         for property in &spec.properties {

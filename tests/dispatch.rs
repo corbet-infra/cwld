@@ -1789,3 +1789,35 @@ reset = ["/bin/vm-dev", "{slot}", "reset"]
             .is_err()
     );
 }
+
+#[test]
+fn the_job_unit_starts_in_the_configured_slice() {
+    use cwld::dispatch::units::SystemdRun;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp("fake-systemd-run-slice");
+    let args = dir.join("args");
+    let script = dir.join("systemd-run");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho \"$@\" > {}\n", args.display()),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let runner = SystemdRun {
+        systemd_run: script.display().to_string(),
+        slice: "ci.slice".to_owned(),
+        ..SystemdRun::default()
+    };
+    let spec = UnitSpec {
+        unit: "cwld-ci-0-x".to_owned(),
+        argv: vec!["true".to_owned()],
+        workdir: dir.clone(),
+        properties: Vec::new(),
+        environment: Vec::new(),
+        stdin: None,
+    };
+    let mut unit = runner.start(&spec).expect("start");
+    while let UnitEvent::Line(_) = unit.next(Duration::from_secs(5)) {}
+    let recorded = std::fs::read_to_string(&args).expect("args");
+    assert!(recorded.contains("--slice=ci.slice"), "{recorded}");
+}

@@ -235,6 +235,10 @@ pub struct CiConfig {
     /// Where systemd exposes a unit's credentials.
     #[serde(default = "d_cred_root")]
     pub credentials_root: PathBuf,
+    /// The slice the job units run in (`systemd-run --slice`); the cgroup
+    /// checks look below it.
+    #[serde(default = "d_slice")]
+    pub slice: String,
     /// The pools.
     #[serde(rename = "pool")]
     pub pools: Vec<PoolSection>,
@@ -242,6 +246,9 @@ pub struct CiConfig {
 
 fn d_state_root() -> PathBuf {
     PathBuf::from("/var/lib")
+}
+fn d_slice() -> String {
+    "system.slice".to_owned()
 }
 fn d_state_directory() -> String {
     "forgejo-runner".to_owned()
@@ -441,7 +448,10 @@ pub fn build(
         &cfg.forge.runner_version,
         cfg.forge.include_user,
     ));
-    let units = Arc::new(SystemdRun::default());
+    let units = Arc::new(SystemdRun {
+        slice: cfg.slice.clone(),
+        ..SystemdRun::default()
+    });
     // what a crashed predecessor left running holds CPUs and caches: end it
     if let Ok(left) = units.sweep("cwld-ci-") {
         for unit in left {

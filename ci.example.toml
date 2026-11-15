@@ -3,6 +3,7 @@
 # (CREDENTIALS_DIRECTORY/mint) of the unit that runs `cwld ci serve`.
 state_dir = "/var/lib/cwld-ci"      # the dispatcher's own: per job the configuration and the credential file
 state_directory = "forgejo-runner"  # below /var/lib: the runner account's state; jobs (slots/<slot>/job.<h>) and the cache (cache/<slot>) are the job unit's own StateDirectory=
+slice = "system.slice"           # the slice of the job units (systemd-run --slice); cgroup checks look below it
 
 [forge]
 api = "https://forge.example/api/v1"
