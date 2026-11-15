@@ -428,3 +428,59 @@ fn a_failed_stop_skips_the_reset_and_reports() {
         "a guest that may still run is never reset"
     );
 }
+
+// --- the command transport -----------------------------------------------------------------------------------------------------
+
+#[test]
+fn the_command_transport_streams_output_feeds_stdin_and_reports_the_status() {
+    use cwld::dispatch::commandguest::CommandGuest;
+    let guest = CommandGuest { transport: vec![] };
+    let mut seen = Vec::new();
+    let outcome = guest
+        .exec_stream(
+            &GuestExec {
+                program: "sh".to_owned(),
+                args: vec!["-s".to_owned()],
+                timeout: Duration::from_secs(10),
+                stdin: Some(b"read t; echo got-$t; echo oops >&2; exit 7\n".to_vec()),
+            },
+            &mut |c| {
+                seen.push(String::from_utf8_lossy(&c.bytes).trim().to_owned());
+                ControlFlow::Continue(())
+            },
+        )
+        .unwrap();
+    assert_eq!(outcome, ExecOutcome::Exited(7));
+    seen.sort();
+    assert_eq!(
+        seen,
+        ["got-", "oops"],
+        "the script came from stdin and ran to its exit"
+    );
+}
+
+#[test]
+fn the_command_transport_kills_the_session_when_the_sink_breaks_or_time_runs_out() {
+    use cwld::dispatch::commandguest::CommandGuest;
+    let guest = CommandGuest { transport: vec![] };
+    let request = |timeout| GuestExec {
+        program: "sh".to_owned(),
+        args: vec!["-c".to_owned(), "echo line; sleep 30".to_owned()],
+        timeout,
+        stdin: None,
+    };
+    let started = std::time::Instant::now();
+    let outcome = guest
+        .exec_stream(&request(Duration::from_secs(20)), &mut |_| {
+            ControlFlow::Break(())
+        })
+        .unwrap();
+    assert_eq!(outcome, ExecOutcome::Cancelled);
+    let outcome = guest
+        .exec_stream(&request(Duration::from_millis(300)), &mut |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(outcome, ExecOutcome::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(10));
+}

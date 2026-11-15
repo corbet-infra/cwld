@@ -15,6 +15,7 @@
 
 pub mod admission;
 pub mod cancel;
+pub mod commandguest;
 pub mod config;
 pub mod exec;
 pub mod flow;
