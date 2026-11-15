@@ -262,12 +262,17 @@ impl UnitRunner for FakeUnits {
             st.config_seen.push(std::fs::read_to_string(c)?);
         }
         st.started.push(spec.clone());
-        st.workdirs.push(spec.workdir.clone());
+        // a runner unit's workdir is the slot directory; the job's tree is `job.<handle>` below it, made by the runner
+        let tree = match spec.argv.iter().position(|a| a == "--handle") {
+            Some(i) => spec.workdir.join(format!("job.{}", spec.argv[i + 1])),
+            None => spec.workdir.clone(),
+        };
+        st.workdirs.push(tree.clone());
         st.kill_flag = false;
         st.release_flag = false;
         drop(st);
         if script.pick {
-            std::fs::create_dir_all(spec.workdir.join("work").join("task-1"))?;
+            std::fs::create_dir_all(tree.join("work").join("task-1"))?;
         }
         Ok(Box::new(FakeRunning {
             lines: script.lines.into(),
@@ -486,9 +491,7 @@ fn a_job_runs_in_a_fresh_unit_and_leaves_nothing() {
     );
     // the runner's tree is the unit's own state directory, removed by the unit as its account
     let has = |p: String| spec.properties.contains(&p);
-    assert!(has(format!(
-        "StateDirectory=runner/slots/0/job.{HANDLE_A} runner/cache/0"
-    )));
+    assert!(has(format!("StateDirectory=runner/slots/0 runner/cache/0")));
     assert!(has(format!(
         "ExecStopPost=/usr/bin/cwld ci scrub {}",
         rig.dir
@@ -1522,6 +1525,23 @@ fn the_scrub_command_removes_job_directories_and_nothing_else() {
     assert!(!run(&dir).success(), "not a job directory");
     assert!(dir.exists());
     assert!(run(&job).success());
+    assert!(!job.exists());
+}
+
+#[test]
+fn the_scrub_needs_a_writable_parent_so_the_state_directory_is_the_slot() {
+    let dir = temp("scrub-parent");
+    let job = dir.join("job.abc");
+    std::fs::create_dir_all(job.join("work")).unwrap();
+    // the sandbox of a job unit: its parent is read-only unless it is the unit's own state directory
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let denied = cwld::dispatch::exec::scrub(&job);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // (root ignores the mode: the read-only case is only asserted for an ordinary account, where it is the sandbox's EROFS)
+    if denied.is_err() {
+        assert!(job.exists(), "a read-only parent cannot lose its child");
+    }
+    cwld::dispatch::exec::scrub(&job).expect("a writable parent (the slot's state directory) can");
     assert!(!job.exists());
 }
 

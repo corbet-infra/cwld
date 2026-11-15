@@ -339,10 +339,9 @@ impl Executor for HostExecutor {
         // the job's directory and the runner's cache are the unit's own state directories (owned
         // by its account, made by systemd); the tree is removed by the unit itself, as that account
         properties.push(format!(
-            "StateDirectory={} {}/cache/{}",
-            self.job_state(&a.job.handle),
-            self.cfg.state_directory,
-            self.slot
+            "StateDirectory={sd}/slots/{slot} {sd}/cache/{slot}",
+            sd = self.cfg.state_directory,
+            slot = self.slot
         ));
         properties.push("StateDirectoryMode=0755".to_owned());
         properties.push(format!(
@@ -350,6 +349,15 @@ impl Executor for HostExecutor {
             self.cfg.scrub_bin.display(),
             dir.display()
         ));
+        // the unit's own state directory is the SLOT directory: below it (a writable mount in the unit's sandbox) the job's
+        // tree `job.<handle>` is made by the runner and removed by ExecStopPost; a per-job state directory could not be removed
+        // from inside the unit (its parent is read-only there, ProtectSystem=strict)
+        let slot_dir = self
+            .cfg
+            .state_root
+            .join(&self.cfg.state_directory)
+            .join("slots")
+            .join(&self.slot);
         let spec = UnitSpec {
             unit: unit.clone(),
             argv: vec![
@@ -361,7 +369,7 @@ impl Executor for HostExecutor {
                 "--config".to_owned(),
                 config_file.display().to_string(),
             ],
-            workdir: dir.clone(),
+            workdir: slot_dir,
             properties,
             environment: self.environment(&unit, &dir),
             stdin: None,
