@@ -193,6 +193,11 @@ struct FakeHost {
     never_ready: Cell<bool>,
     start_fails: Cell<bool>,
     silent: Cell<bool>,
+    replicas_fail: Cell<bool>,
+    /// The replica counts the fake platform reports, by tenant (default 1).
+    replicas: RefCell<BTreeMap<String, u32>>,
+    /// Replica reads and tenant stops in the order they happened.
+    timeline: RefCell<Vec<String>>,
 }
 
 impl FakeHost {
@@ -205,6 +210,20 @@ impl FakeHost {
     fn with_card(self, facts: Vec<DeviceFacts>) -> Self {
         *self.card.borrow_mut() = facts;
         self
+    }
+
+    fn with_replicas(self, tenant: &str, count: u32) -> Self {
+        self.replicas.borrow_mut().insert(tenant.to_owned(), count);
+        self
+    }
+
+    fn replicas_fail(self) -> Self {
+        self.replicas_fail.set(true);
+        self
+    }
+
+    fn timeline(&self) -> Vec<String> {
+        self.timeline.borrow().clone()
     }
 
     fn with_state(self, id: &str, state: InstanceState) -> Self {
@@ -433,12 +452,23 @@ impl HostDevices for FakeHost {
 }
 
 impl HostGpu for FakeHost {
+    fn tenant_replicas(&self, tenant: &str, _ladder: GpuLadder) -> cdrv::Result<u32> {
+        self.timeline
+            .borrow_mut()
+            .push(format!("replicas:{tenant}"));
+        if self.replicas_fail.get() {
+            return Err("injected replica read failure".into());
+        }
+        Ok(self.replicas.borrow().get(tenant).copied().unwrap_or(1))
+    }
+
     fn stop_tenant(&self, tenant: &str, ladder: GpuLadder) -> cdrv::Result<()> {
+        self.timeline.borrow_mut().push(format!("stop:{tenant}"));
         self.record(format!("tenant-stop:{tenant}:{ladder}"))
     }
 
-    fn start_tenant(&self, tenant: &str, ladder: GpuLadder) -> cdrv::Result<()> {
-        self.record(format!("tenant-start:{tenant}:{ladder}"))
+    fn start_tenant(&self, tenant: &str, ladder: GpuLadder, replicas: u32) -> cdrv::Result<()> {
+        self.record(format!("tenant-start:{tenant}:{ladder}:x{replicas}"))
     }
 
     fn sunshine_follows(&self, kernel: &KernelOwner) -> cdrv::Result<()> {
@@ -1110,6 +1140,177 @@ fn a_stop_timeout_ends_failed_and_says_a_human_is_needed() {
 // The plan executor
 // ---------------------------------------------------------------------------
 
+/// A hand-off that remembers every table it was asked to record, in order.
+#[derive(Default)]
+struct SpyHandoff {
+    recorded: Vec<Vec<(String, u32)>>,
+    fail: bool,
+}
+
+impl cwld::DisplacedHandoff for SpyHandoff {
+    fn record(&mut self, plan: &cdct::SwitchPlan) -> Result<(), HandoffError> {
+        if self.fail {
+            return Err(HandoffError::Store("injected".to_owned()));
+        }
+        self.recorded.push(
+            plan.displaced
+                .iter()
+                .map(|d| (d.tenant.clone(), d.replicas))
+                .collect(),
+        );
+        Ok(())
+    }
+}
+
+fn counted_host() -> FakeHost {
+    FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Defined)
+        .with_replicas("gpu-serving", 3)
+        .with_replicas("gpu-batch", 2)
+}
+
+#[test]
+fn replica_counts_are_read_before_the_first_stop() {
+    let tree = TempTree::new("replicas-first");
+    let mut runtime = runtime(&tree);
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let host = counted_host();
+    let hosts = host_set(&host);
+    let mut spy = SpyHandoff::default();
+    let report = runtime
+        .execute_plan(&mac_plan(), &hosts, &mut event_log(), at(), &mut spy)
+        .expect("the journal is writable");
+    assert!(report.is_complete());
+    let timeline = host.timeline();
+    let first_stop = timeline
+        .iter()
+        .position(|e| e.starts_with("stop:"))
+        .unwrap();
+    let last_read = timeline
+        .iter()
+        .rposition(|e| e.starts_with("replicas:"))
+        .unwrap();
+    assert!(last_read < first_stop, "{timeline:?}");
+    assert_eq!(
+        timeline
+            .iter()
+            .filter(|e| e.starts_with("replicas:"))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn the_handoff_holds_the_counts_before_any_stop_and_after_the_plan() {
+    let tree = TempTree::new("replicas-recorded");
+    let mut runtime = runtime(&tree);
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let host = counted_host();
+    let hosts = host_set(&host);
+    let mut spy = SpyHandoff::default();
+    runtime
+        .execute_plan(&mac_plan(), &hosts, &mut event_log(), at(), &mut spy)
+        .expect("the journal is writable");
+    assert_eq!(
+        spy.recorded.len(),
+        2,
+        "once before the first stop, once after the plan"
+    );
+    for table in &spy.recorded {
+        assert!(table.contains(&("gpu-serving".to_owned(), 3)), "{table:?}");
+        assert!(table.contains(&("gpu-batch".to_owned(), 2)), "{table:?}");
+    }
+}
+
+#[test]
+fn the_counts_survive_a_later_failing_step() {
+    let tree = TempTree::new("replicas-survive");
+    let mut runtime = runtime(&tree);
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let host = counted_host().failing("start:mac-desktop");
+    let hosts = host_set(&host);
+    let mut spy = SpyHandoff::default();
+    let report = runtime
+        .execute_plan(&mac_plan(), &hosts, &mut event_log(), at(), &mut spy)
+        .expect("the journal is writable");
+    assert!(!report.is_complete());
+    assert_eq!(report.handoff, HandoffStatus::NotAttempted);
+    assert_eq!(
+        spy.recorded.len(),
+        1,
+        "recorded before the stops, never lost"
+    );
+    assert!(spy.recorded[0].contains(&("gpu-serving".to_owned(), 3)));
+}
+
+#[test]
+fn nothing_is_stopped_when_the_counts_cannot_be_read_or_recorded() {
+    for (host, fail_record) in [
+        (counted_host().replicas_fail(), false),
+        (counted_host(), true),
+    ] {
+        let tree = TempTree::new("replicas-refuse");
+        let mut runtime = runtime(&tree);
+        runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+        let hosts = host_set(&host);
+        let mut spy = SpyHandoff {
+            fail: fail_record,
+            ..SpyHandoff::default()
+        };
+        let report = runtime
+            .execute_plan(&mac_plan(), &hosts, &mut event_log(), at(), &mut spy)
+            .expect("the journal is writable");
+        assert!(!report.is_complete());
+        assert!(report.executed.is_empty());
+        assert!(
+            !host.timeline().iter().any(|e| e.starts_with("stop:")),
+            "{:?}",
+            host.timeline()
+        );
+    }
+}
+
+#[test]
+fn a_restore_passes_the_stored_count() {
+    let tree = TempTree::new("replicas-restore");
+    let mut runtime = runtime(&tree);
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let stored = vec![
+        DisplacedTenant {
+            tenant: "gpu-serving".to_owned(),
+            ladder: GpuLadder::Interactive,
+            replicas: 3,
+        },
+        DisplacedTenant {
+            tenant: "gpu-batch".to_owned(),
+            ladder: GpuLadder::BestEffort,
+            replicas: 2,
+        },
+    ];
+    let reverse = back_plan(&stored);
+    let host = FakeHost::new().with_state("mac-desktop", InstanceState::Running);
+    let hosts = host_set(&host);
+    let report = runtime
+        .execute_plan(
+            &reverse,
+            &hosts,
+            &mut event_log(),
+            at(),
+            &mut DiscardHandoff,
+        )
+        .expect("the journal is writable");
+    assert!(report.is_complete());
+    let calls = host.calls();
+    assert!(
+        calls.contains(&"tenant-start:gpu-serving:gpu-interactive:x3".to_owned()),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&"tenant-start:gpu-batch:gpu-besteffort:x2".to_owned()),
+        "{calls:?}"
+    );
+}
+
 #[test]
 fn a_full_mac_switch_hands_over_the_card_and_records_what_it_displaced() {
     let tree = TempTree::new("mac-switch");
@@ -1178,9 +1379,9 @@ fn a_full_mac_switch_hands_over_the_card_and_records_what_it_displaced() {
             "stop:mac-desktop:Clean".to_owned(),
             format!("unbind:{}", address(gpu_address())),
             format!("reset:{}", address(gpu_address())),
-            "tenant-start:desktop-session:gpu-desktop".to_owned(),
-            "tenant-start:gpu-serving:gpu-interactive".to_owned(),
-            "tenant-start:gpu-batch:gpu-besteffort".to_owned(),
+            "tenant-start:desktop-session:gpu-desktop:x1".to_owned(),
+            "tenant-start:gpu-serving:gpu-interactive:x1".to_owned(),
+            "tenant-start:gpu-batch:gpu-besteffort:x1".to_owned(),
             "sunshine:host".to_owned(),
         ]
     );
@@ -1228,7 +1429,11 @@ fn a_windows_switch_stops_the_office_profile_first() {
         .expect("the journal is writable");
     assert!(report.is_complete());
     assert_eq!(report.handoff, HandoffStatus::Recorded);
-    assert_eq!(handoff.recorded, vec![plan.displaced.clone()]);
+    // once before the first tenant is stopped (with the live counts), once after the plan
+    assert_eq!(
+        handoff.recorded,
+        vec![plan.displaced.clone(), plan.displaced.clone()]
+    );
 
     let calls = host.calls();
     let office_stop = calls

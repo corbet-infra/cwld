@@ -221,6 +221,46 @@ impl Runtime {
             Severity::Info,
             json!({"target": plan.target, "steps": plan.steps.len()}),
         )];
+        // The replica counts are read BEFORE the first tenant is stopped and recorded durably
+        // with the holder: a crash after a stop would otherwise restore one replica instead
+        // of the original count. Nothing has been stopped yet when this fails.
+        let counted;
+        let plan = if plan
+            .steps
+            .iter()
+            .any(|step| matches!(step, PlanStep::StopHostTenant { .. }))
+        {
+            match Self::count_displaced(plan, hosts, handoff) {
+                Ok(with_counts) => {
+                    counted = with_counts;
+                    &counted
+                }
+                Err(error) => {
+                    events.push(log.emit(
+                        at,
+                        "plan.step_failed",
+                        Subject::Host,
+                        Severity::Error,
+                        json!({"target": plan.target, "index": 0, "error": error.to_string()}),
+                    ));
+                    let first = plan.steps[0].clone();
+                    return Ok(PlanReport {
+                        target: plan.target.clone(),
+                        executed: Vec::new(),
+                        failed: Some(StepFailure {
+                            index: 0,
+                            step: first,
+                            error,
+                        }),
+                        not_run: plan.steps.clone(),
+                        handoff: HandoffStatus::NotAttempted,
+                        events,
+                    });
+                }
+            }
+        } else {
+            plan
+        };
         let mut journal = self.journals().begin(plan, at)?;
         let mut executed = Vec::new();
         for (index, step) in plan.steps.iter().enumerate() {
@@ -297,6 +337,36 @@ impl Runtime {
         })
     }
 
+    /// The plan with every displaced tenant's live replica count filled in, after the
+    /// counts were handed to the hand-off (a guest target only; a host target restores
+    /// the stored counts and has nothing to read).
+    fn count_displaced<H: DisplacedHandoff>(
+        plan: &SwitchPlan,
+        hosts: &Hosts<'_>,
+        handoff: &mut H,
+    ) -> Result<SwitchPlan, StepError> {
+        let mut counted = plan.clone();
+        let action = "read the replica counts of the displaced tenants".to_owned();
+        for displaced in &mut counted.displaced {
+            displaced.replicas = hosts
+                .gpu(&action)?
+                .tenant_replicas(&displaced.tenant, displaced.ladder)
+                .map_err(|error| StepError::Driver {
+                    action: format!("read the replicas of host tenant {}", displaced.tenant),
+                    message: error.to_string(),
+                })?;
+        }
+        if !counted.target.is_host() {
+            handoff
+                .record(&counted)
+                .map_err(|error| StepError::Driver {
+                    action: "record the displaced tenants before stopping them".to_owned(),
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(counted)
+    }
+
     fn run_step(
         &mut self,
         step: &PlanStep,
@@ -316,11 +386,15 @@ impl Runtime {
                         message: error.to_string(),
                     })
             }
-            PlanStep::StartHostTenant { tenant, ladder } => {
+            PlanStep::StartHostTenant {
+                tenant,
+                ladder,
+                replicas,
+            } => {
                 let action = format!("start host tenant {tenant}");
                 hosts
                     .gpu(&action)?
-                    .start_tenant(tenant, *ladder)
+                    .start_tenant(tenant, *ladder, *replicas)
                     .map_err(|error| StepError::Driver {
                         action,
                         message: error.to_string(),

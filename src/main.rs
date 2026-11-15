@@ -243,8 +243,12 @@ fn step_line(step: &PlanStep) -> String {
             format!("hand the card {device} over: {from} -> {to}")
         }
         PlanStep::StartInstance { instance } => format!("start instance {instance}"),
-        PlanStep::StartHostTenant { tenant, ladder } => {
-            format!("start host tenant {tenant} ({ladder})")
+        PlanStep::StartHostTenant {
+            tenant,
+            ladder,
+            replicas,
+        } => {
+            format!("start host tenant {tenant} ({ladder}), {replicas} replica(s)")
         }
         PlanStep::SunshineFollows { kernel } => format!("Sunshine follows {kernel}"),
     }
@@ -375,8 +379,13 @@ impl HostGpu for LoggingHost {
         Ok(())
     }
 
-    fn start_tenant(&self, tenant: &str, ladder: GpuLadder) -> cdrv::Result<()> {
-        self.log(&format!("start_tenant({tenant}, {ladder})"));
+    fn tenant_replicas(&self, tenant: &str, ladder: GpuLadder) -> cdrv::Result<u32> {
+        self.log(&format!("tenant_replicas({tenant}, {ladder})"));
+        Ok(1)
+    }
+
+    fn start_tenant(&self, tenant: &str, ladder: GpuLadder, replicas: u32) -> cdrv::Result<()> {
+        self.log(&format!("start_tenant({tenant}, {ladder}, {replicas})"));
         Ok(())
     }
 
