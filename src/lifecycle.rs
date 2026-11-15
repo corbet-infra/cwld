@@ -1,10 +1,16 @@
 //! One lifecycle state machine per instance.
 //!
-//! The states and transitions are exactly those of `CONTRACTS.md` section 6:
+//! The states and transitions are those of `CONTRACTS.md` section 6:
 //! `Defined`, `Starting`, `Running`, `Stopping`, `Stopped` and `Failed`. A
 //! transition the table does not name is a typed error, never a guess. The
 //! machine has no `destroy`: `cwld` never destroys on its own, and a stop
 //! timeout ends in `Failed` with an event that says a human is needed.
+//!
+//! One transition goes beyond the table: `Stopped` + `Start` → `Starting`. The
+//! owner's rule is that a persistent instance (`desktop`, `dev`, `office`) that
+//! was stopped starts again; only ephemeral classes go through a reset to
+//! `Defined` first, which the runtime does before it asks the machine to
+//! start.
 //!
 //! Every accepted transition emits one `cdrv` event. An observation from
 //! reconcile (`Observe`) is legal from any state: it adopts what the driver
@@ -138,7 +144,8 @@ impl Lifecycle {
                 Severity::Info,
                 json!({}),
             ),
-            (Some(InstanceState::Defined), Trigger::Start) => (
+            (Some(InstanceState::Defined), Trigger::Start)
+            | (Some(InstanceState::Stopped), Trigger::Start) => (
                 InstanceState::Starting,
                 "instance.starting",
                 Severity::Info,

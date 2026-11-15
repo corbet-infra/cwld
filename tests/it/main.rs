@@ -1033,7 +1033,6 @@ fn illegal_transitions_are_typed_errors() {
         (Lifecycle::observed(InstanceState::Defined), Trigger::Ready),
         (Lifecycle::observed(InstanceState::Running), Trigger::Start),
         (Lifecycle::observed(InstanceState::Starting), Trigger::Stop),
-        (Lifecycle::observed(InstanceState::Stopped), Trigger::Start),
         (Lifecycle::observed(InstanceState::Stopping), Trigger::Reset),
         (
             Lifecycle::observed(InstanceState::Failed("crash".to_owned())),
@@ -1046,6 +1045,24 @@ fn illegal_transitions_are_typed_errors() {
             .expect_err("the transition is illegal");
         assert!(matches!(error, TransitionError::Illegal { .. }));
     }
+}
+
+#[test]
+fn a_stopped_persistent_instance_starts_again() {
+    let instance = InstanceId::from("example-vm");
+    let mut log = event_log();
+
+    // The state machine itself knows no classes: a stopped instance starts.
+    let mut lifecycle = Lifecycle::observed(InstanceState::Stopped);
+    let event = lifecycle
+        .advance(Trigger::Start, &mut log, at(), &instance)
+        .expect("a stopped instance may start")
+        .expect("the transition emits an event");
+    assert_eq!(event.kind, "instance.starting");
+    assert_eq!(lifecycle.state(), Some(&InstanceState::Starting));
+
+    // A stopped ephemeral instance reaches the same trigger through the
+    // runtime's reset to `Defined`, which this test covers at the plan level.
 }
 
 #[test]
@@ -1693,6 +1710,42 @@ fn a_stopped_ephemeral_instance_is_reset_before_it_starts() {
             "disk-reset:ci-1".to_owned(),
         ]
     );
+}
+
+#[test]
+fn a_stopped_persistent_instance_starts_without_a_reset() {
+    let tree = TempTree::new("stopped-persistent");
+    let mut runtime = runtime(&tree);
+    let cases = [
+        ("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs),
+        ("dev-1", InstanceClass::Dev, GuestOs::Linux),
+        ("office", InstanceClass::Office, GuestOs::Windows),
+    ];
+    for (id, class, guest_os) in cases {
+        runtime.register(spec(id, class, guest_os));
+        let instance = InstanceId::from(id);
+        let host = FakeHost::new().with_state(id, InstanceState::Stopped);
+        let hosts = host_set(&host);
+        let plan = SwitchPlan {
+            target: KernelOwner::Host,
+            memory: None,
+            displaced: Vec::new(),
+            steps: vec![PlanStep::StartInstance {
+                instance: instance.clone(),
+            }],
+        };
+        let mut log = event_log();
+        let report = runtime
+            .execute_plan(&plan, &hosts, &mut log, at(), &mut DiscardHandoff)
+            .expect("the journal is writable");
+        assert!(report.is_complete(), "{id} starts from Stopped: {report:?}");
+        assert_eq!(runtime.state(&instance), Some(&InstanceState::Running));
+        assert_eq!(
+            host.calls(),
+            vec![format!("start:{id}")],
+            "{id} starts again without a disk reset"
+        );
+    }
 }
 
 #[test]

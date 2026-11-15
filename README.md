@@ -14,12 +14,13 @@ report what was left half done.
   load from TOML or JSON and are validated at load; invalid data is an error
   before anything runs.
 - **One lifecycle state machine.** `Defined`, `Starting`, `Running`, `Stopping`,
-  `Stopped`, `Failed`, with exactly the transitions of `CONTRACTS.md` section 6.
-  An illegal transition is a typed error. `cwld` never destroys on its own, and
-  a stop timeout ends in `Failed` with an event that says a human is needed.
-  Waits never poll: `cwld` reads the instance's state once, then follows the
-  lifecycle events the driver pushes, against a deadline on the contract's one
-  clock.
+  `Stopped`, `Failed`, with the transitions of `CONTRACTS.md` section 6. A
+  stopped persistent instance (`desktop`, `dev`, `office`) starts again; only an
+  ephemeral class is reset to `Defined` first. An illegal transition is a typed
+  error. `cwld` never destroys on its own, and a stop timeout ends in `Failed`
+  with an event that says a human is needed. Waits never poll: `cwld` reads the
+  instance's state once, then follows the lifecycle events the driver pushes,
+  against a deadline on the contract's one clock.
 - **Plan executor.** A `cdct::SwitchPlan` is data. `cwld` executes it in order,
   stops at the first failed step, emits the event and returns a typed report of
   what ran, what failed and what was never reached. A guest switch that finishes
