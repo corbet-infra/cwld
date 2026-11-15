@@ -10,7 +10,7 @@
 //! | Forgejo | [`forge`] | [`forge::Forge`] | [`forge::ForgeClient`] over [`http::CurlHttp`] |
 //! | RAM admission | [`admission`] | [`admission::Admission`] | [`admission::ConductorAdmission`] (`cdct` rules) |
 //! | host slot | [`exec`], [`units`] | [`units::UnitRunner`] | [`units::SystemdRun`] |
-//! | VM slot | [`exec`] | [`exec::VmDriver`] | none yet (needs a streaming guest exec) |
+//! | VM slot | [`exec`] | [`exec::VmDriver`] | [`vmdriver::RuntimeVmDriver`] (`cdrv` `exec_stream`) |
 //! | job flow, spares, drain | [`flow`] | | |
 
 pub mod admission;
@@ -22,3 +22,4 @@ pub mod forge;
 pub mod http;
 pub mod secret;
 pub mod units;
+pub mod vmdriver;

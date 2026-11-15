@@ -112,7 +112,7 @@ pub struct Runtime {
     journals: Journals,
     specs: BTreeMap<InstanceId, InstanceSpec>,
     lifecycles: BTreeMap<InstanceId, Lifecycle>,
-    clock: Box<dyn Clock>,
+    clock: Box<dyn Clock + Send>,
 }
 
 impl Runtime {
@@ -132,7 +132,7 @@ impl Runtime {
 
     /// Replace the clock the wait deadlines are measured on.
     #[must_use]
-    pub fn with_clock(mut self, clock: Box<dyn Clock>) -> Self {
+    pub fn with_clock(mut self, clock: Box<dyn Clock + Send>) -> Self {
         self.clock = clock;
         self
     }

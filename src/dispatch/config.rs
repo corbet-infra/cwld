@@ -334,8 +334,8 @@ pub fn read_credential(dir: Option<&Path>, name: &str) -> Result<Secret, ConfigE
 }
 
 /// Build the production dispatcher: curl for the forge, systemd units for host
-/// pools. VM pools need a [`super::exec::VmDriver`] and are refused here until
-/// the OS driver can stream a guest job's output.
+/// pools. VM pools need an OS driver behind [`super::vmdriver::RuntimeVmDriver`]
+/// and are refused here until one is linked.
 ///
 /// # Errors
 /// A pool the build cannot serve, or an unreadable file.
@@ -364,7 +364,7 @@ pub fn build(
     for p in &cfg.pools {
         if p.kind != "host" {
             return Err(ConfigError::Invalid(format!(
-                "pool {}: no VM driver is linked yet (needs a streaming guest exec); only host pools are served",
+                "pool {}: no OS driver (clnx host and guest adapters) is linked into this binary yet; `vmdriver::RuntimeVmDriver` is ready for it, only host pools are served",
                 p.label
             )));
         }
