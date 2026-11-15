@@ -16,6 +16,7 @@ idle_ms = 4000       # otherwise; nothing is asked while every slot is busy
 
 [[pool]]
 label = "linux"
+aliases = ["heavy"]  # more labels the pool serves; the runner template must carry them too
 kind = "host"        # a transient unit per job, cgroup.kill at the end
 claim_mib = 2048
 pickup_s = 20

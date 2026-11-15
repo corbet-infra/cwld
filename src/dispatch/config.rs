@@ -173,6 +173,9 @@ fn d_job_timeout() -> u64 {
 pub struct PoolSection {
     /// The label.
     pub label: String,
+    /// Further labels the pool serves (`heavy` beside `linux`).
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// `host` (a transient unit) or `vm` (a ci-class instance).
     pub kind: String,
     /// RAM claim per job, MiB.
@@ -314,6 +317,14 @@ impl CiConfig {
                     "pool label {:?} is invalid or repeated",
                     pool.label
                 ));
+            }
+            for alias in &pool.aliases {
+                if !is_name(alias) || !labels.insert(alias.clone()) {
+                    return bad(format!(
+                        "pool {:?}: alias {alias:?} is invalid or repeated",
+                        pool.label
+                    ));
+                }
             }
             if pool.slots.is_empty() {
                 return bad(format!("pool {} has no slot", pool.label));
@@ -570,6 +581,7 @@ fn unreachable_vm() -> VmSection {
 fn pool_of(p: &PoolSection, factory: ExecutorFactory) -> Pool {
     Pool {
         label: p.label.clone(),
+        aliases: p.aliases.clone(),
         claim_mib: p.claim_mib,
         slots: p
             .slots

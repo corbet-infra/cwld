@@ -376,6 +376,7 @@ impl Rig {
         });
         let pool = Pool {
             label: "linux".to_owned(),
+            aliases: vec!["heavy".to_owned()],
             claim_mib: 1000,
             slots: slots
                 .iter()
@@ -869,6 +870,7 @@ fn a_start_that_fails_burns_no_registration() {
     let factory: ExecutorFactory = Arc::new(|_| Box::new(FailingPrepare));
     let pool = Pool {
         label: "linux".to_owned(),
+        aliases: Vec::new(),
         claim_mib: 10,
         slots: vec![SlotCfg {
             id: "0".to_owned(),
@@ -992,6 +994,7 @@ fn vm_rig(vm: Arc<FakeVm>, jobs: Vec<(Scope, WaitingJob)>) -> (Arc<Dispatcher>, 
         Arc::new(move |_| Box::new(VmExecutor::new(vm.clone(), "ci-0", Duration::from_secs(30))));
     let pool = Pool {
         label: "macos".to_owned(),
+        aliases: Vec::new(),
         claim_mib: 8192,
         slots: vec![SlotCfg {
             id: "mac-0".to_owned(),
@@ -1820,4 +1823,24 @@ fn the_job_unit_starts_in_the_configured_slice() {
     while let UnitEvent::Line(_) = unit.next(Duration::from_secs(5)) {}
     let recorded = std::fs::read_to_string(&args).expect("args");
     assert!(recorded.contains("--slice=ci.slice"), "{recorded}");
+}
+
+#[test]
+fn a_job_asking_for_an_alias_of_the_pool_runs_in_it() {
+    let rig = Rig::host(
+        &["0"],
+        vec![plain(&["job output"], 0)],
+        0,
+        vec![(org("o1"), job(1, HANDLE_A, "heavy"))],
+        FakeAdmission::granting(),
+        100,
+    );
+    rig.run_cycle();
+    let st = lock(&rig.units.state);
+    assert_eq!(
+        st.started.len(),
+        1,
+        "the alias label reaches the pool's slot"
+    );
+    assert_eq!(st.started[0].unit, format!("cwld-ci-0-{HANDLE_A}"));
 }

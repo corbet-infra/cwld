@@ -42,6 +42,9 @@ pub struct SlotCfg {
 pub struct Pool {
     /// The label jobs ask for.
     pub label: String,
+    /// Further labels this pool serves (a job that asks for exactly one of them
+    /// runs here as well); the runner template carries them too.
+    pub aliases: Vec<String>,
     /// The RAM one job of this label claims, in MiB.
     pub claim_mib: u64,
     /// The slots.
@@ -278,7 +281,7 @@ impl Dispatcher {
             .pools
             .iter()
             .filter(|p| p.slots.iter().any(|s| free.contains(&s.id)))
-            .map(|p| p.label.clone())
+            .flat_map(|p| std::iter::once(p.label.clone()).chain(p.aliases.iter().cloned()))
             .collect();
         let scopes = inner.scopes(now)?;
         // one listing per scope, a few at a time (every listing is one HTTP request)
@@ -447,7 +450,7 @@ impl Inner {
             .pools
             .iter()
             .enumerate()
-            .find(|(_, p)| p.label == job.label)?;
+            .find(|(_, p)| p.label == job.label || p.aliases.contains(&job.label))?;
         let free = pool.slots.iter().filter(|s| !st.busy.contains(&s.id));
         let mut first = None;
         for slot in free {
