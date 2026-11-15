@@ -1,0 +1,33 @@
+[package]
+name = "cwld"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
+description = "The workload runtime: classes, lifecycle and plan execution for VMs, containers and jails"
+repository = "https://github.com/corbet-infra/cwld"
+
+[lib]
+name = "cwld"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cwld"
+path = "src/main.rs"
+
+[dependencies]
+cdct = { path = "../cdct" }
+cdrv = { path = "../cdrv" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "1"
+
+# `cdct` names `cdrv` by its git URL; the two crates are one contract at one
+# commit, so patch the git source to the local path. The patch goes away when
+# `cwld` follows the published crates.
+[patch."https://git.corbet.ch/corbet-infra/cdrv.git"]
+cdrv = { path = "../cdrv" }
+
+[lints.rust]
+unsafe_code = "forbid"
