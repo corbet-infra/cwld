@@ -42,6 +42,8 @@ pub mod dirty;
 pub mod dispatch;
 pub mod handoff;
 pub mod journal;
+#[cfg(feature = "clnx")]
+pub mod ladder;
 pub mod lifecycle;
 #[cfg(feature = "clnx")]
 pub mod linux;

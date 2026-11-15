@@ -41,12 +41,29 @@ impl HolderHandoff {
 
 impl DisplacedHandoff for HolderHandoff {
     fn record(&mut self, plan: &SwitchPlan) -> Result<(), HandoffError> {
-        let target = plan.target.guest().ok_or(HandoffError::HostTarget)?;
         let mut store = HolderStore::open(&self.path)
             .map_err(|error| HandoffError::Store(error.to_string()))?;
         let mut table = store
             .load()
             .map_err(|error| HandoffError::Store(error.to_string()))?;
+        let Some(target) = plan.target.guest() else {
+            // A ladder shed: the card stays on the host, the counts go to the shed list.
+            if plan.displaced.is_empty() {
+                return Err(HandoffError::HostTarget);
+            }
+            for counted in &plan.displaced {
+                if let Some(shed) = table
+                    .shed
+                    .iter_mut()
+                    .find(|shed| shed.tenant == counted.tenant)
+                {
+                    shed.replicas = counted.replicas;
+                }
+            }
+            return store
+                .save(&table)
+                .map_err(|error| HandoffError::Store(error.to_string()));
+        };
         let holder = table
             .holders
             .iter_mut()
@@ -87,7 +104,8 @@ impl DaemonHandoff {
 
 impl DisplacedHandoff for DaemonHandoff {
     fn record(&mut self, plan: &SwitchPlan) -> Result<(), HandoffError> {
-        if plan.target.is_host() {
+        // A host target records only a ladder shed's counts.
+        if plan.target.is_host() && plan.displaced.is_empty() {
             return Err(HandoffError::HostTarget);
         }
         let mut client = Client::connect(&self.endpoint)

@@ -63,6 +63,45 @@ pub struct HostConfig {
     /// The instances this host runs.
     #[serde(default)]
     pub instances: Vec<InstanceEntry>,
+    /// The live ladder's observer; absent, the conductor only switches.
+    #[serde(default)]
+    pub ladder: Option<LadderConfig>,
+}
+
+/// Where the live ladder's facts and events come from.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LadderConfig {
+    /// This host's Kubernetes node name.
+    pub node: String,
+    /// The shared model broker, when one runs on the card.
+    #[serde(default)]
+    pub broker: Option<BrokerEntry>,
+    /// The GPU device plugin's registration guard.
+    #[serde(default)]
+    pub guard: Option<GuardEntry>,
+}
+
+/// The device plugin and the resources it must advertise while it runs.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardEntry {
+    /// The extended resources the plugin advertises.
+    pub resources: Vec<String>,
+    /// Its pods' namespace.
+    pub namespace: String,
+    /// Its pods' label selector.
+    pub labels: String,
+}
+
+/// The model broker as a Kubernetes Service.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerEntry {
+    /// `namespace/name` of the Service.
+    pub service: String,
+    /// The Service port of its HTTP API.
+    pub port: u16,
 }
 
 /// Where the desktop session's unit lives.
@@ -98,6 +137,20 @@ pub struct InstanceEntry {
     /// The clean-stop command, program first, no shell.
     #[serde(default)]
     pub clean_stop: Option<Vec<String>>,
+    /// BARs of the card's GPU function this guest gets shrunk (a guest that
+    /// cannot use the full ReBAR window, such as macOS); empty: as they are.
+    #[serde(default)]
+    pub bar_limits: Vec<BarLimitEntry>,
+}
+
+/// One BAR size limit for a guest.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BarLimitEntry {
+    /// The BAR index.
+    pub bar: u8,
+    /// The largest size the guest gets, in MiB.
+    pub mib: u64,
 }
 
 fn default_libvirt() -> String {
@@ -247,6 +300,27 @@ fn execute(
             instances = instances.with_clean_stop(entry.spec.id.as_str(), argv.clone());
         }
     }
+    // The guest the card goes to may take it only with some BARs shrunk.
+    let bar_limits: Vec<clnx::BarLimit> = plan
+        .target
+        .guest()
+        .and_then(|guest| {
+            config
+                .instances
+                .iter()
+                .find(|entry| &entry.spec.id == guest)
+        })
+        .map(|entry| {
+            entry
+                .bar_limits
+                .iter()
+                .map(|limit| clnx::BarLimit {
+                    bar: limit.bar,
+                    mib: limit.mib,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let devices = InventoryDevices {
         inner: LinuxDevices::new(
             LinuxSysfs::system(),
@@ -254,7 +328,8 @@ fn execute(
             functions.clone(),
             config.host_driver.clone(),
         )
-        .with_holder_wait(Duration::from_secs(config.holder_wait_secs)),
+        .with_holder_wait(Duration::from_secs(config.holder_wait_secs))
+        .with_bar_limits(bar_limits),
         name,
         functions,
     };
@@ -273,6 +348,13 @@ fn execute(
             desktop_unit: config.desktop.unit.clone(),
             sunshine_unit: config.desktop.sunshine_unit.clone(),
             sunshine_in_user_manager: config.desktop.sunshine_in_user_manager,
+            device_plugin: config.ladder.as_ref().and_then(|ladder| {
+                ladder.guard.as_ref().map(|guard| clnx::DevicePlugin {
+                    namespace: guard.namespace.clone(),
+                    labels: guard.labels.clone(),
+                    node: ladder.node.clone(),
+                })
+            }),
         },
     );
     let hosts = Hosts::new(&instances, &devices).with_gpu(&gpu);
@@ -376,6 +458,48 @@ pub fn follow(path: &Path) -> Result<(), String> {
         })
         .map_err(|error| format!("cannot install the stop handler: {error}"))?;
     }
+    if let Some(ladder) = &config.ladder {
+        let (_, functions) = Inventory::load(&config.inventory)?;
+        let card = functions
+            .iter()
+            .copied()
+            .find(|address| address.function == 0)
+            .unwrap_or(functions[0]);
+        let broker = match &ladder.broker {
+            Some(entry) => {
+                let (namespace, name) = entry.service.split_once('/').ok_or_else(|| {
+                    format!(
+                        "{}: the broker service {} is not namespace/name",
+                        path.display(),
+                        entry.service
+                    )
+                })?;
+                Some(clnx::pressure::BrokerConfig {
+                    namespace: namespace.to_owned(),
+                    name: name.to_owned(),
+                    port: entry.port,
+                })
+            }
+            None => None,
+        };
+        crate::ladder::start(
+            clnx::pressure::PressureConfig {
+                node: ladder.node.clone(),
+                card,
+                broker,
+                guard: ladder
+                    .guard
+                    .as_ref()
+                    .map(|guard| clnx::pressure::GuardConfig {
+                        resources: guard.resources.clone(),
+                        namespace: guard.namespace.clone(),
+                        labels: guard.labels.clone(),
+                    }),
+            },
+            config.conductor.clone(),
+        )?;
+        println!("cwld: the live ladder observes node {}", ladder.node);
+    }
     let mut client = Client::connect(&Endpoint::LocalSocket(config.conductor.clone()))
         .map_err(|error| format!("cannot reach the conductor: {error}"))?;
     client
@@ -444,6 +568,31 @@ mod tests {
         assert_eq!(config.argocd_namespace, "argocd");
         assert!(config.desktop.sunshine_unit.is_none());
         assert_eq!(config.instances[0].clean_stop.as_ref().unwrap()[0], "ssh");
+    }
+
+    #[test]
+    fn a_host_file_carries_bar_limits_and_the_ladder() {
+        let config: HostConfig = serde_json::from_str(
+            r#"{"host":"example-host","conductor":"/run/cdct/control.sock",
+                "state_dir":"/var/lib/cwld","inventory":"/etc/example/gpu.json",
+                "host_driver":"amdgpu","desktop":{"unit":"desktop-session.service"},
+                "instances":[{"spec":{"id":"guest-a","kind":"vm","guest_os":"macos",
+                  "memory":{"min_mib":1024,"max_mib":1024,"balloon":false},
+                  "cpu":{"quota_cores":2.0},"class":"desktop","devices":[],"disks":[]},
+                  "bar_limits":[{"bar":0,"mib":1024}]}],
+                "ladder":{"node":"example-node",
+                  "broker":{"service":"llm/example-broker","port":8080},
+                  "guard":{"resources":["example.com/slot"],"namespace":"kube-system",
+                    "labels":"app=example-plugin"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.instances[0].bar_limits[0].mib, 1024);
+        let ladder = config.ladder.unwrap();
+        assert_eq!(ladder.broker.unwrap().port, 8080);
+        assert_eq!(
+            ladder.guard.unwrap().resources,
+            vec!["example.com/slot".to_owned()]
+        );
     }
 
     #[test]

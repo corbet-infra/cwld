@@ -267,6 +267,7 @@ fn step_line(step: &PlanStep) -> String {
             format!("start host tenant {tenant} ({ladder}), {replicas} replica(s)")
         }
         PlanStep::SunshineFollows { kernel } => format!("Sunshine follows {kernel}"),
+        PlanStep::RestartDevicePlugin => "restart the GPU device plugin".to_owned(),
     }
 }
 
@@ -407,6 +408,11 @@ impl HostGpu for LoggingHost {
 
     fn sunshine_follows(&self, kernel: &KernelOwner) -> cdrv::Result<()> {
         self.log(&format!("sunshine_follows({kernel})"));
+        Ok(())
+    }
+
+    fn restart_device_plugin(&self) -> cdrv::Result<()> {
+        self.log("restart_device_plugin()");
         Ok(())
     }
 }

@@ -387,7 +387,9 @@ impl Runtime {
         counted.steps.retain(|step| {
             !matches!(step, PlanStep::StopHostTenant { tenant, .. } if idle.contains(tenant))
         });
-        if !counted.target.is_host() {
+        // A guest switch records its displaced set with the new holder; a ladder
+        // shed (the card stays on the host) records the count with the shed.
+        if !counted.target.is_host() || !counted.displaced.is_empty() {
             handoff
                 .record(&counted)
                 .map_err(|error| StepError::Driver {
@@ -448,6 +450,16 @@ impl Runtime {
                 hosts
                     .gpu(&action)?
                     .sunshine_follows(kernel)
+                    .map_err(|error| StepError::Driver {
+                        action,
+                        message: error.to_string(),
+                    })
+            }
+            PlanStep::RestartDevicePlugin => {
+                let action = "restart the GPU device plugin".to_owned();
+                hosts
+                    .gpu(&action)?
+                    .restart_device_plugin()
                     .map_err(|error| StepError::Driver {
                         action,
                         message: error.to_string(),
