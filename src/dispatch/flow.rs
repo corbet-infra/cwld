@@ -352,7 +352,16 @@ impl Dispatcher {
                 st.stats.dispatched += 1;
             }
             let worker = Arc::clone(inner);
-            let handle = std::thread::spawn(move || worker.run_slot(pool_idx, &slot, &scope, &job));
+            let handle = std::thread::spawn(move || {
+                // a panic must not wedge the drain: the slot stays out of service and is reported
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker.run_slot(pool_idx, &slot, &scope, &job);
+                }));
+                if run.is_err() {
+                    worker.say("job-thread-panicked", &[("slot", slot.id.clone())]);
+                    worker.finish(&slot.id, false);
+                }
+            });
             lock(&self.handles).push(handle);
         }
         Ok(!inner.free_slots().is_empty())

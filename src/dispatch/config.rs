@@ -135,6 +135,14 @@ pub struct PoolSection {
     /// starts the unit with `User=` this name; a host pool must name one (a
     /// transient unit would otherwise run as root).
     pub run_as: Option<String>,
+    /// Host pools: a command (argv) run as the job's account before the runner
+    /// starts, to take the resource the job owns (the Windows test clone is woken).
+    #[serde(default)]
+    pub pre: Vec<String>,
+    /// Host pools: a command run after the job ended, whatever happened (the
+    /// clone is rolled back); the slot is free again only when it succeeded.
+    #[serde(default)]
+    pub post: Vec<String>,
     /// Host pools: the job environment. A value may hold `{unit}`, `{slot}`,
     /// `{job_dir}` and `{credentials}`.
     #[serde(default)]
@@ -388,6 +396,8 @@ pub fn build(
                 .map_err(|e| ConfigError::Load(format!("cannot find myself: {e}")))?,
             pickup: Duration::from_secs(p.pickup_s),
             properties,
+            pre: p.pre.clone(),
+            post: p.post.clone(),
             environment: p.environment.clone().into_iter().collect(),
             slot_environment: Vec::new(),
             credentials_root: cfg.credentials_root.clone(),

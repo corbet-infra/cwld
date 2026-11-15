@@ -134,6 +134,13 @@ pub struct HostSettings {
     /// `cache/<slot>` below it as its own `StateDirectory=`; the job's tree
     /// is removed by the unit's `ExecStopPost=` as the runner account.
     pub state_directory: String,
+    /// A command (argv) run as its own unit, as the job's account, before the
+    /// runner starts: it gets the resource the job owns (the Windows test clone
+    /// is woken). Failing keeps the job with the forge and backs the slot off.
+    pub pre: Vec<String>,
+    /// A command run after the job's unit has ended, WHATEVER happened (the
+    /// clone is rolled back). The slot is not free until it succeeded.
+    pub post: Vec<String>,
     /// The binary `ExecStopPost=` runs (`<it> ci scrub <dir>`).
     pub scrub_bin: PathBuf,
     /// Seconds without a task before the registration is given back.
@@ -162,6 +169,8 @@ pub struct HostExecutor {
     job_dir: Option<PathBuf>,
     own_dir: Option<PathBuf>,
     unit: Option<String>,
+    /// Whether the pre-job command ran (the post-job command is then owed).
+    pre_ran: bool,
 }
 
 impl HostExecutor {
@@ -175,6 +184,7 @@ impl HostExecutor {
             job_dir: None,
             own_dir: None,
             unit: None,
+            pre_ran: false,
         }
     }
 
@@ -184,6 +194,34 @@ impl HostExecutor {
             "{}/slots/{}/job.{handle}",
             self.cfg.state_directory, self.slot
         )
+    }
+
+    /// Run a hook command as a unit of its own (same account and sandbox as the
+    /// job), wait for it and report its status.
+    fn run_hook(
+        &self,
+        suffix: &str,
+        argv: &[String],
+        unit_base: &str,
+        dir: &Path,
+    ) -> Result<(), String> {
+        let spec = UnitSpec {
+            unit: format!("{unit_base}-{suffix}"),
+            argv: argv.to_vec(),
+            workdir: dir.to_path_buf(),
+            properties: self.cfg.properties.clone(),
+            environment: self.environment(unit_base, dir),
+        };
+        let mut running = self
+            .units
+            .start(&spec)
+            .map_err(|e| format!("cannot start the {suffix}-job command: {e}"))?;
+        while !matches!(running.next(Duration::from_secs(3600)), UnitEvent::Closed) {}
+        match running.wait() {
+            Ok(0) => Ok(()),
+            Ok(code) => Err(format!("the {suffix}-job command ended with status {code}")),
+            Err(e) => Err(format!("the {suffix}-job command: {e}")),
+        }
     }
 
     fn cache_dir(&self) -> PathBuf {
@@ -256,8 +294,19 @@ impl Executor for HostExecutor {
             .map_err(|e| fail(e.to_string()))?;
         // the runner-owned directory is made by systemd when the unit starts
         self.job_dir = Some(self.cfg.state_root.join(self.job_state(&job.handle)));
-        self.own_dir = Some(own);
-        self.unit = Some(unit);
+        self.own_dir = Some(own.clone());
+        self.unit = Some(unit.clone());
+        if !self.cfg.pre.is_empty() {
+            // owed from the first attempt on: a half-run pre command is also undone by the post one
+            self.pre_ran = true;
+            // `memory: true` is the dispatcher's "back the slot off" mark; the memory guard and a
+            // failed pre-job command both ask for it
+            self.run_hook("pre", &self.cfg.pre, &unit, &own)
+                .map_err(|reason| ExecError::Prepare {
+                    reason,
+                    memory: true,
+                })?;
+        }
         Ok(())
     }
 
@@ -384,6 +433,16 @@ impl Executor for HostExecutor {
                 )));
             }
         }
+        if self.pre_ran && !self.cfg.post.is_empty() {
+            let dir = self
+                .own_dir
+                .clone()
+                .unwrap_or_else(|| self.cfg.state_dir.clone());
+            let unit = self.unit.clone().unwrap_or_default();
+            self.run_hook("post", &self.cfg.post, &unit, &dir)
+                .map_err(ExecError::Teardown)?;
+        }
+        self.pre_ran = false;
         if let Some(own) = self.own_dir.clone() {
             scrub(&own).map_err(|e| {
                 ExecError::Teardown(format!("cannot remove {}: {e}", own.display()))

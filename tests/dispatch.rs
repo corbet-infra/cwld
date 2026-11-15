@@ -256,7 +256,9 @@ impl UnitRunner for FakeUnits {
             let mode = std::fs::metadata(p)?.permissions().mode() & 0o777;
             st.token_seen.push((std::fs::read_to_string(p)?, mode));
         }
-        if let Some(c) = spec.argv.last() {
+        if spec.argv.iter().any(|a| a == "--config")
+            && let Some(c) = spec.argv.last()
+        {
             st.config_seen.push(std::fs::read_to_string(c)?);
         }
         st.started.push(spec.clone());
@@ -304,6 +306,8 @@ fn settings(dir: &std::path::Path, pickup_ms: u64) -> HostSettings {
         state_root: dir.join("var-lib"),
         state_directory: "runner".to_owned(),
         scrub_bin: PathBuf::from("/usr/bin/cwld"),
+        pre: Vec::new(),
+        post: Vec::new(),
         pickup: Duration::from_millis(pickup_ms),
         properties: vec!["Delegate=yes".to_owned(), "User=jobs".to_owned()],
         environment: vec![
@@ -349,10 +353,23 @@ impl Rig {
         admission: Arc<FakeAdmission>,
         pickup_ms: u64,
     ) -> Self {
+        Self::host_with(slots, scripts, stubborn, jobs, admission, pickup_ms, |_| {})
+    }
+
+    fn host_with(
+        slots: &[&str],
+        scripts: Vec<Script>,
+        stubborn: usize,
+        jobs: Vec<(Scope, WaitingJob)>,
+        admission: Arc<FakeAdmission>,
+        pickup_ms: u64,
+        tweak: impl FnOnce(&mut HostSettings),
+    ) -> Self {
         let dir = temp("host");
         let forge = FakeForge::with(jobs);
         let units = FakeUnits::new(scripts, stubborn);
-        let cfg = settings(&dir, pickup_ms);
+        let mut cfg = settings(&dir, pickup_ms);
+        tweak(&mut cfg);
         let u = Arc::clone(&units);
         let factory: ExecutorFactory = Arc::new(move |slot: &str| -> Box<dyn Executor> {
             Box::new(HostExecutor::new(u.clone(), cfg.clone(), slot))
@@ -1502,4 +1519,91 @@ fn the_scrub_command_removes_job_directories_and_nothing_else() {
     assert!(dir.exists());
     assert!(run(&job).success());
     assert!(!job.exists());
+}
+
+// --- pre- and post-job commands (the Windows test clone) --------------------------------------------------------------------
+
+fn clone_hooks(c: &mut HostSettings) {
+    c.pre = vec![
+        "/bin/systemctl".to_owned(),
+        "start".to_owned(),
+        "wake-clone".to_owned(),
+    ];
+    c.post = vec![
+        "/bin/systemctl".to_owned(),
+        "start".to_owned(),
+        "roll-back-clone".to_owned(),
+    ];
+}
+
+fn hooked(scripts: Vec<Script>) -> Rig {
+    Rig::host_with(
+        &["6"],
+        scripts,
+        0,
+        vec![(org("o1"), job(1, HANDLE_A, "linux"))],
+        FakeAdmission::granting(),
+        100,
+        clone_hooks,
+    )
+}
+
+#[test]
+fn the_clone_is_woken_before_the_job_and_rolled_back_after_it() {
+    let rig = hooked(vec![
+        plain(&[], 0),
+        plain(&["test output"], 0),
+        plain(&[], 0),
+    ]);
+    rig.run_cycle();
+    let st = lock(&rig.units.state);
+    let names: Vec<_> = st.started.iter().map(|s| s.unit.clone()).collect();
+    assert_eq!(
+        names,
+        [
+            format!("cwld-ci-6-{HANDLE_A}-pre"),
+            format!("cwld-ci-6-{HANDLE_A}"),
+            format!("cwld-ci-6-{HANDLE_A}-post"),
+        ]
+    );
+    assert_eq!(st.started[0].argv[2], "wake-clone");
+    assert_eq!(st.started[2].argv[2], "roll-back-clone");
+    assert!(
+        st.started[0].properties.contains(&"User=jobs".to_owned()),
+        "same account and sandbox as the job"
+    );
+    drop(st);
+    assert!(rig.dispatcher.busy_slots().is_empty());
+}
+
+#[test]
+fn a_failed_wake_mints_no_registration_and_still_rolls_the_clone_back() {
+    let rig = hooked(vec![plain(&[], 1), plain(&[], 0)]);
+    rig.run_cycle();
+    assert_eq!(rig.forge.registrations(), 0, "the job stays with the forge");
+    let st = lock(&rig.units.state);
+    assert_eq!(st.started.len(), 2);
+    assert!(st.started[1].unit.ends_with("-post"));
+    drop(st);
+    assert!(rig.log_text().contains("prepare-failed"));
+    assert!(rig.dispatcher.busy_slots().is_empty());
+}
+
+#[test]
+fn the_slot_stays_busy_until_the_roll_back_works() {
+    let rig = hooked(vec![
+        plain(&[], 0),
+        plain(&[], 0),
+        plain(&[], 1),
+        plain(&[], 0),
+    ]);
+    rig.run_cycle();
+    let st = lock(&rig.units.state);
+    assert_eq!(st.started.len(), 4, "the post command ran twice");
+    drop(st);
+    assert!(rig.log_text().contains("teardown-failed"));
+    assert!(
+        rig.dispatcher.busy_slots().is_empty(),
+        "free only after it succeeded"
+    );
 }

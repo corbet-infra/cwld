@@ -20,7 +20,9 @@ use cwld::dispatch::exec::{
 };
 use cwld::dispatch::forge::{Registration, Scope, ScopeKind};
 use cwld::dispatch::secret::Secret;
-use cwld::dispatch::vmdriver::{NO_TASK_EXIT, RuntimeVmDriver, SharedGuest, VmSettings};
+use cwld::dispatch::vmdriver::{
+    NO_TASK_EXIT, RuntimeVmDriver, SharedGuest, VmSettings, base64_encode,
+};
 use cwld::{ClassCatalog, Runtime};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -307,16 +309,46 @@ fn chunks_become_lines_and_the_token_travels_on_stdin_only() {
     assert_eq!(exit, VmExit::Code(0));
     assert_eq!(lines, ["first line", "second", "oops", "third, unfinished"]);
     let request = lock(&guest.requests)[0].clone();
-    assert_eq!(
-        request.stdin.as_deref(),
-        Some(b"single-use-token".as_slice())
-    );
-    assert!(
-        !request.args.join(" ").contains("single-use-token"),
-        "the token is in no argument"
-    );
-    assert!(request.args.join(" ").contains("--pickup-s 20"));
+    assert_eq!(request.program, "bash");
+    assert_eq!(request.args, ["-s"]);
+    let payload = String::from_utf8(request.stdin.clone().unwrap()).unwrap();
+    // the token is in the payload only base64-encoded, in no argument and not in Debug output
+    assert!(!payload.contains("single-use-token"));
+    assert!(payload.contains(&base64_encode(b"single-use-token")));
+    assert!(!request.args.join(" ").contains("single-use-token"));
     assert!(!format!("{request:?}").contains("single-use-token"));
+    // the guest job is started like runner-vm-slot starts it
+    assert!(payload.contains(
+        "/Volumes/cache/bin/vm-guest-job \"$d\" aaaaaaaa-0000-0000-0000-000000000001 20 < /dev/null || rc=$?"
+    ));
+    assert!(payload.contains("d=/tmp/rv-job-aaaaaaaa-0000-0000-0000-000000000001\n"));
+    assert!(payload.ends_with("exit \"$rc\"\n"));
+}
+
+#[test]
+fn base64_matches_the_standard_vectors() {
+    for (plain, coded) in [
+        ("", ""),
+        ("f", "Zg=="),
+        ("fo", "Zm8="),
+        ("foo", "Zm9v"),
+        ("foobar", "Zm9vYmFy"),
+    ] {
+        assert_eq!(base64_encode(plain.as_bytes()), coded);
+    }
+}
+
+#[test]
+fn an_unsafe_assignment_is_refused_before_anything_is_sent() {
+    let guest = FakeGuest::with(Vec::new(), 0);
+    let (driver, _) = rig(&guest);
+    let mut a = assignment();
+    a.registration.token = Secret::new("short");
+    let result = driver.run_job("ci-win-0", &a, Duration::from_secs(20), &mut |_| {
+        Flow::Continue
+    });
+    assert!(matches!(result, Err(VmError::Failed(_))));
+    assert!(lock(&guest.requests).is_empty());
 }
 
 #[test]

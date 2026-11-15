@@ -7,18 +7,18 @@
 //! disk. Start, stop and reset go through [`Runtime`], so the lifecycle rules,
 //! the event log and the readiness waits are the ones every other plan uses.
 //!
-//! The guest side is a small wrapper the guest image ships (its path is
-//! [`VmSettings::guest_program`]). Its contract:
-//!
-//! * arguments: `one-job --handle <h> --scope <name> --url <forge root>
-//!   --uuid <runner uuid> --pickup-s <n>`;
-//! * the single-use registration token arrives on standard input only (never
-//!   in an argument list, which any process list shows);
-//! * it runs `forgejo-runner one-job --wait --handle <h>` for that job, and
-//!   exits with [`NO_TASK_EXIT`] when no task showed up within the pickup
-//!   deadline, otherwise with the runner's status.
+//! The guest side is the one the macOS build clone already has (`hosts/vm-dev/guest-job.sh`,
+//! installed in the guest as `vm-guest-job`), driven exactly as `runner-vm-slot` drives it:
+//! ONE guest session runs `bash -s`, and the payload script on its standard input unpacks the
+//! job (the runner configuration with the single-use registration, the token file, the
+//! credentials, the placement view) into a private job directory and runs
+//! `vm-guest-job <dir> <handle> <pickup>`. The registration therefore travels on standard
+//! input only, never in an argument list and never in a file on the host. The guest job exits
+//! with [`NO_TASK_EXIT`] (75) when no task showed up within the pickup deadline, otherwise
+//! with the runner's status.
 
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -45,8 +45,17 @@ pub type SharedGuest = Arc<dyn GuestAgent + Send + Sync>;
 /// How guest jobs are run.
 #[derive(Debug, Clone)]
 pub struct VmSettings {
-    /// The wrapper program inside the guest.
-    pub guest_program: String,
+    /// The runner configuration without connection (JSON), as for a host pool.
+    pub template: serde_json::Value,
+    /// The guest path of the job script (`vm-guest-job`).
+    pub guest_job: String,
+    /// The guest directory below which a job directory is made.
+    pub guest_tmp: String,
+    /// Credential files shipped into the job directory (`sccache-aws`,
+    /// `forgejo-ci-read`): name and host path; a file that is unreadable is skipped.
+    pub credentials: Vec<(String, PathBuf)>,
+    /// The placement view ccid reads (optional, not a secret).
+    pub placement: Option<PathBuf>,
     /// The longest a guest job may run before the driver ends it.
     pub job_timeout: Duration,
 }
@@ -54,11 +63,110 @@ pub struct VmSettings {
 impl Default for VmSettings {
     fn default() -> Self {
         Self {
-            guest_program: "/usr/local/bin/cwld-ci-job".to_owned(),
+            template: serde_json::json!({"server": {}, "host": {}, "cache": {}}),
+            guest_job: "/Volumes/cache/bin/vm-guest-job".to_owned(),
+            guest_tmp: "/tmp".to_owned(),
+            credentials: Vec::new(),
+            placement: None,
             // longer than the runner's own job timeout (3 h)
             job_timeout: Duration::from_secs(3 * 3600 + 600),
         }
     }
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with padding (the guest decodes with `base64 -D`).
+#[must_use]
+pub fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(B64[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn valid_token(token: &str) -> bool {
+    (8..=200).contains(&token.len())
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The payload script the guest session runs (`bash -s`); a port of `runner-vm-slot`'s
+/// `build_payload`. Everything that is not plain text travels base64-encoded in a quoted
+/// here-document, so no value is ever interpreted by the guest's shell.
+fn payload(settings: &VmSettings, a: &Assignment, pickup: Duration) -> Result<String, VmError> {
+    let bad = |what: &str| VmError::Failed(format!("refusing the assignment: {what}"));
+    let handle = &a.job.handle;
+    if !super::forge::is_handle(handle) {
+        return Err(bad("the handle"));
+    }
+    if !super::forge::is_name(&a.scope.name) {
+        return Err(bad("the scope"));
+    }
+    if !valid_token(a.registration.token.expose()) {
+        return Err(bad("the registration token"));
+    }
+    let gd = format!(
+        "{}/rv-job-{handle}",
+        settings.guest_tmp.trim_end_matches('/')
+    );
+    if gd.contains(['\'', '"', '\n', '$', '`', '\\', ' ']) {
+        return Err(bad("the guest directory"));
+    }
+    let mut cfg = settings.template.clone();
+    cfg["server"]["connections"] = serde_json::json!({
+        a.scope.name.clone(): {
+            "url": a.runner_url,
+            "uuid": a.registration.uuid,
+            "token_url": format!("file:{gd}/token"),
+        }
+    });
+    cfg["host"]["workdir_parent"] = serde_json::json!(format!("{gd}/work"));
+    cfg["cache"]["dir"] = serde_json::json!(format!("{gd}/cache"));
+    let mut out = String::new();
+    out.push_str("set -eu\numask 077\n");
+    out.push_str(&format!("d={gd}\n"));
+    out.push_str("mkdir -p \"$d/work\" \"$d/cache\" \"$d/credentials\"\n");
+    out.push_str("dec() { base64 -D > \"$1\"; }\n");
+    let mut put = |name: &str, bytes: &[u8]| {
+        out.push_str(&format!(
+            "dec \"$d/{name}\" <<'RV_B64'\n{}\nRV_B64\n",
+            base64_encode(bytes)
+        ));
+    };
+    put("config.yml", cfg.to_string().as_bytes());
+    put("token", a.registration.token.expose().as_bytes());
+    for (name, path) in &settings.credentials {
+        if let Ok(bytes) = std::fs::read(path) {
+            put(&format!("credentials/{name}"), &bytes);
+        }
+    }
+    if let Some(path) = &settings.placement
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        put("placement.json", &bytes);
+    }
+    out.push_str("rc=0\n");
+    // the job reads no stdin (the rest of this script would be its input)
+    out.push_str(&format!(
+        "{} \"$d\" {handle} {} < /dev/null || rc=$?\n",
+        settings.guest_job,
+        pickup.as_secs()
+    ));
+    out.push_str("rm -r \"$d\" 2> /dev/null || true\nexit \"$rc\"\n");
+    Ok(out)
 }
 
 /// The driver over a runtime, a host and one guest agent per instance.
@@ -172,23 +280,11 @@ impl<H: VmHost> VmDriver for RuntimeVmDriver<H> {
     ) -> Result<VmExit, VmError> {
         let guest = (self.guests)(instance);
         let request = GuestExec {
-            program: self.settings.guest_program.clone(),
-            args: vec![
-                "one-job".to_owned(),
-                "--handle".to_owned(),
-                assignment.job.handle.clone(),
-                "--scope".to_owned(),
-                assignment.scope.name.clone(),
-                "--url".to_owned(),
-                assignment.runner_url.clone(),
-                "--uuid".to_owned(),
-                assignment.registration.uuid.clone(),
-                "--pickup-s".to_owned(),
-                pickup.as_secs().to_string(),
-            ],
+            program: "bash".to_owned(),
+            args: vec!["-s".to_owned()],
             timeout: self.settings.job_timeout,
-            // the registration token travels on standard input only
-            stdin: Some(assignment.registration.token.expose().as_bytes().to_vec()),
+            // the registration travels on standard input only
+            stdin: Some(payload(&self.settings, assignment, pickup)?.into_bytes()),
         };
         let mut lines = Lines::default();
         let mut aborted = false;
