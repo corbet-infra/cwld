@@ -5,6 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,9 +18,10 @@ use cdct::{
 };
 use cdrv::{
     CpuClaim, DeviceAddress, DeviceClass, DeviceFacts, DeviceFilter, Event, EventId, EventLog,
-    EventStream, ExecResult, GuestAgent, GuestExec, GuestHealth, GuestOs, HolderId, HostDevices,
-    HostGpu, HostInstances, InstanceClass, InstanceId, InstanceKind, InstanceSpec, InstanceState,
-    LeaseId, MemoryClaim, Severity, ShutdownMode, Source, StopMode, Subject, Timestamp,
+    EventStream, ExecChunk, ExecOutcome, ExecResult, ExecStream, GuestAgent, GuestExec,
+    GuestHealth, GuestOs, HolderId, HostDevices, HostGpu, HostInstances, InstanceClass, InstanceId,
+    InstanceKind, InstanceSpec, InstanceState, LeaseId, MemoryClaim, Severity, ShutdownMode,
+    Source, StopMode, Subject, Timestamp,
 };
 use cwld::{
     CiJob, ClassCatalog, CleanOutcome, Clock, DirtyReason, DiscardHandoff, DiskReset,
@@ -483,6 +485,21 @@ impl GuestAgent for FakeGuest {
         })
     }
 
+    fn exec_stream(
+        &self,
+        _request: &GuestExec,
+        sink: &mut dyn FnMut(ExecChunk) -> ControlFlow<()>,
+    ) -> cdrv::Result<ExecOutcome> {
+        let chunk = ExecChunk {
+            stream: ExecStream::Stdout,
+            bytes: b"ok\n".to_vec(),
+        };
+        if sink(chunk).is_break() {
+            return Ok(ExecOutcome::Cancelled);
+        }
+        Ok(ExecOutcome::Exited(self.status))
+    }
+
     fn free_page_reporting(&self, _enable: bool) -> cdrv::Result<()> {
         Ok(())
     }
@@ -517,6 +534,7 @@ fn gpu_address() -> DeviceAddress {
 /// One PCI function of a card, as the hardware inventory reports it.
 fn function(name: &str, address: DeviceAddress, class: DeviceClass) -> DeviceFacts {
     DeviceFacts {
+        bar0_bytes: None,
         name: name.to_owned(),
         address: Some(address),
         vendor: None,
@@ -605,6 +623,10 @@ fn spec(id: &str, class: InstanceClass, guest_os: GuestOs) -> InstanceSpec {
             Vec::new()
         },
         disks: Vec::new(),
+        vcpus: None,
+        nic: None,
+        console: false,
+        identity: None,
     }
 }
 
