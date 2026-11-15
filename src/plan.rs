@@ -7,20 +7,22 @@
 //! table, the hand-off `cdct` documents.
 //!
 //! Every side effect goes through a trait: the `cdrv` host traits for
-//! instances and devices, and the two small ports in [`crate::ports`] for what
-//! `cdrv` does not define yet. `cwld` never runs `virsh`, `zfs`, `systemctl`,
-//! `kubectl` or reads sysfs.
+//! instances, devices, host GPU tenants and Sunshine, and the one port in
+//! [`crate::ports`] for what `cdrv` does not define yet (the disk reset that
+//! `cdsk` will own). `cwld` never runs `virsh`, `zfs`, `systemctl`, `kubectl`
+//! or reads sysfs.
 
 use cdct::{KernelOwner, PlanStep, SwitchPlan};
 use cdrv::{
-    Event, EventLog, HostDevices, HostInstances, InstanceId, Severity, StopMode, Subject, Timestamp,
+    Event, EventLog, HostDevices, HostGpu, HostInstances, InstanceId, Severity, StopMode, Subject,
+    Timestamp,
 };
 use serde_json::json;
 use thiserror::Error;
 
 use crate::handoff::DisplacedHandoff;
 use crate::lifecycle::TransitionError;
-use crate::ports::{DiskReset, HostPlatform};
+use crate::ports::DiskReset;
 use crate::runtime::Runtime;
 use crate::store::StoreError;
 
@@ -31,7 +33,7 @@ pub struct Hosts<'a> {
     /// Exclusive devices on this host.
     pub devices: &'a dyn HostDevices,
     /// Host GPU tenants and the Sunshine service, when the host provides them.
-    pub platform: Option<&'a dyn HostPlatform>,
+    pub gpu: Option<&'a dyn HostGpu>,
     /// Disk reset to a clean snapshot, when the host provides it.
     pub disk_reset: Option<&'a dyn DiskReset>,
 }
@@ -43,15 +45,15 @@ impl<'a> Hosts<'a> {
         Self {
             instances,
             devices,
-            platform: None,
+            gpu: None,
             disk_reset: None,
         }
     }
 
-    /// Attach the host platform port.
+    /// Attach the host GPU platform.
     #[must_use]
-    pub fn with_platform(mut self, platform: &'a dyn HostPlatform) -> Self {
-        self.platform = Some(platform);
+    pub fn with_gpu(mut self, gpu: &'a dyn HostGpu) -> Self {
+        self.gpu = Some(gpu);
         self
     }
 
@@ -62,10 +64,10 @@ impl<'a> Hosts<'a> {
         self
     }
 
-    pub(crate) fn platform(&self, action: &str) -> Result<&'a dyn HostPlatform, StepError> {
-        self.platform.ok_or_else(|| StepError::NoPort {
+    pub(crate) fn gpu(&self, action: &str) -> Result<&'a dyn HostGpu, StepError> {
+        self.gpu.ok_or_else(|| StepError::NoPort {
             action: action.to_owned(),
-            port: "HostPlatform",
+            port: "HostGpu",
         })
     }
 }
@@ -304,7 +306,7 @@ impl Runtime {
             PlanStep::StopHostTenant { tenant, ladder } => {
                 let action = format!("stop host tenant {tenant}");
                 hosts
-                    .platform(&action)?
+                    .gpu(&action)?
                     .stop_tenant(tenant, *ladder)
                     .map_err(|error| StepError::Driver {
                         action,
@@ -314,7 +316,7 @@ impl Runtime {
             PlanStep::StartHostTenant { tenant, ladder } => {
                 let action = format!("start host tenant {tenant}");
                 hosts
-                    .platform(&action)?
+                    .gpu(&action)?
                     .start_tenant(tenant, *ladder)
                     .map_err(|error| StepError::Driver {
                         action,
@@ -336,7 +338,7 @@ impl Runtime {
             PlanStep::SunshineFollows { kernel } => {
                 let action = format!("move Sunshine to {kernel}");
                 hosts
-                    .platform(&action)?
+                    .gpu(&action)?
                     .sunshine_follows(kernel)
                     .map_err(|error| StepError::Driver {
                         action,

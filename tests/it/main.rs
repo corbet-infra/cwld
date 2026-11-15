@@ -17,14 +17,14 @@ use cdct::{
 };
 use cdrv::{
     CpuClaim, DeviceAddress, DeviceFacts, DeviceFilter, Event, EventId, EventLog, EventStream,
-    ExecResult, GuestAgent, GuestExec, GuestHealth, GuestOs, HolderId, HostDevices, HostInstances,
-    InstanceClass, InstanceId, InstanceKind, InstanceSpec, InstanceState, LeaseId, MemoryClaim,
-    Severity, ShutdownMode, Source, StopMode, Subject, Timestamp,
+    ExecResult, GuestAgent, GuestExec, GuestHealth, GuestOs, HolderId, HostDevices, HostGpu,
+    HostInstances, InstanceClass, InstanceId, InstanceKind, InstanceSpec, InstanceState, LeaseId,
+    MemoryClaim, Severity, ShutdownMode, Source, StopMode, Subject, Timestamp,
 };
 use cwld::{
     CiJob, ClassCatalog, CleanOutcome, Clock, DirtyReason, DiscardHandoff, DiskReset,
-    DisplacedHandoff, HandoffError, HandoffStatus, Hibernation, HolderHandoff, HostPlatform, Hosts,
-    Lifecycle, MemoryRule, ParseError, Runtime, RuntimeError, StepError, TransitionError, Trigger,
+    DisplacedHandoff, HandoffError, HandoffStatus, Hibernation, HolderHandoff, Hosts, Lifecycle,
+    MemoryRule, ParseError, Runtime, RuntimeError, StepError, TransitionError, Trigger,
     ValidationError,
 };
 use serde_json::json;
@@ -415,7 +415,7 @@ impl HostDevices for FakeHost {
     }
 }
 
-impl HostPlatform for FakeHost {
+impl HostGpu for FakeHost {
     fn stop_tenant(&self, tenant: &str, ladder: GpuLadder) -> cdrv::Result<()> {
         self.record(format!("tenant-stop:{tenant}:{ladder}"))
     }
@@ -553,9 +553,7 @@ fn runtime_at(tree: &TempTree, now: Timestamp) -> Runtime {
 }
 
 fn host_set(host: &FakeHost) -> Hosts<'_> {
-    Hosts::new(host, host)
-        .with_platform(host)
-        .with_disk_reset(host)
+    Hosts::new(host, host).with_gpu(host).with_disk_reset(host)
 }
 
 fn spec(id: &str, class: InstanceClass, guest_os: GuestOs) -> InstanceSpec {
@@ -1499,7 +1497,7 @@ fn a_plan_without_its_ports_fails_with_a_typed_error() {
     assert!(matches!(
         failed.error,
         StepError::NoPort {
-            port: "HostPlatform",
+            port: "HostGpu",
             ..
         }
     ));

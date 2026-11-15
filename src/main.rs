@@ -12,11 +12,11 @@ use std::process::ExitCode;
 
 use cdct::{GpuLadder, KernelOwner, PlanStep, SwitchOutcome, SwitchPlan};
 use cdrv::{
-    DeviceAddress, DeviceFacts, DeviceFilter, EventLog, EventStream, HostDevices, HostInstances,
-    InstanceId, InstanceSpec, InstanceState, Source, StopMode, Timestamp,
+    DeviceAddress, DeviceFacts, DeviceFilter, EventLog, EventStream, HostDevices, HostGpu,
+    HostInstances, InstanceId, InstanceSpec, InstanceState, Source, StopMode, Timestamp,
 };
 use clap::{Parser, Subcommand};
-use cwld::{ClassCatalog, DiscardHandoff, DiskReset, HostPlatform, Hosts, Runtime};
+use cwld::{ClassCatalog, DiscardHandoff, DiskReset, Hosts, Runtime};
 
 /// The workload runtime: executes what the conductor decided.
 #[derive(Debug, Parser)]
@@ -74,7 +74,7 @@ fn run_plan(path: &Path, dry_run: bool, gpu: DeviceAddress) -> ExitCode {
     };
     let host = LoggingHost::new();
     let hosts = Hosts::new(&host, &host)
-        .with_platform(&host)
+        .with_gpu(&host)
         .with_disk_reset(&host);
     let mut log = EventLog::new("dry-run", Source::Cwld, 1);
     println!("plan: switch the card to {}", plan.target);
@@ -279,7 +279,7 @@ impl HostDevices for LoggingHost {
     }
 }
 
-impl HostPlatform for LoggingHost {
+impl HostGpu for LoggingHost {
     fn stop_tenant(&self, tenant: &str, ladder: GpuLadder) -> cdrv::Result<()> {
         self.log(&format!("stop_tenant({tenant}, {ladder})"));
         Ok(())

@@ -2,9 +2,9 @@
 //!
 //! `cwld` acts on decisions from the conductor (`cdct`) and on the owner's
 //! requests, and it acts only through the `cdrv` host and guest traits (plus
-//! the two small ports in [`ports`] for what `cdrv` does not define yet). It
-//! never runs `virsh`, `zfs`, `systemctl` or `kubectl`, and it never reads
-//! sysfs.
+//! the one small port in [`ports`] for what `cdrv` does not define yet: the
+//! disk reset `cdsk` will own). It never runs `virsh`, `zfs`, `systemctl` or
+//! `kubectl`, and it never reads sysfs.
 //!
 //! The pieces:
 //! - [`classes`] holds the four classes (`dev`, `desktop`, `ci`, `office`) as
@@ -58,7 +58,7 @@ pub use handoff::{DiscardHandoff, DisplacedHandoff, HandoffError, HolderHandoff}
 pub use journal::{Journals, PlanJournal};
 pub use lifecycle::{Lifecycle, TransitionError, Trigger};
 pub use plan::{HandoffStatus, Hosts, PlanReport, StepError, StepFailure};
-pub use ports::{DiskReset, HostPlatform};
+pub use ports::DiskReset;
 pub use recovery::{DirtyReport, HalfRunPlan, RecoveryReport};
 pub use runtime::{CleanOutcome, Runtime, RuntimeError};
 pub use store::StoreError;

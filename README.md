@@ -41,8 +41,8 @@ report what was left half done.
   admitted and what a switch does are `cdct`'s decisions; `cwld` executes them.
 - run `virsh`, `zfs`, `systemctl`, `kubectl` or any other host tool, or read
   sysfs. Every side effect goes through a trait: the `cdrv` host and guest
-  traits, plus the two ports in `src/ports.rs` for what `cdrv` does not define
-  yet (host GPU tenants and Sunshine, and the disk reset `cdsk` will own).
+  traits, plus the one port in `src/ports.rs` for what `cdrv` does not define
+  yet, the disk reset that the storage component (`cdsk`) will own.
 - destroy an instance on its own. There is no destroy path in the lifecycle;
   a failed stop stops the plan and needs a human.
 - hold host data (PCI addresses, serials, hostnames, IPs, VM names), macOS
