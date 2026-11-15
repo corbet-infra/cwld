@@ -15,11 +15,13 @@
 //!
 //! The deadline is measured on the contract's one clock, the same clock the
 //! events carry: an event that reports a state but arrives after the deadline
-//! ends the wait as a timeout. A driver-reported `Failed` ends the wait at
+//! ends the wait as a timeout, and so does the deadline passing with no event
+//! at all. A driver-reported `Failed` ends the wait at
 //! once, and a stream that ends without the wanted state is a typed error:
 //! nothing is retried blindly and nothing is destroyed. Tests drive a fake
 //! stream and a fake [`Clock`], so no test waits on wall time.
 
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use cdrv::{Event, HostInstances, InstanceId, InstanceState, Subject, Timestamp};
@@ -152,8 +154,33 @@ pub(crate) fn wait_for(
         instance: instance.clone(),
         message: error.to_string(),
     })?;
+    // The stream blocks until the driver pushes an event, so it is drained on
+    // its own thread: the deadline then ends the wait even when no event ever
+    // comes (a guest that ignores the stop request). Nothing is polled; the
+    // thread ends at the stream's next event once this wait has returned.
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for event in events {
+            if sender.send(event).is_err() {
+                break;
+            }
+        }
+    });
     let mut last = observed;
-    for event in events {
+    loop {
+        let left = deadline.saturating_sub(clock.now().as_millis());
+        let event = match receiver.recv_timeout(Duration::from_millis(left)) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(WaitError::Timeout {
+                    instance: instance.clone(),
+                    want,
+                    timeout_secs: timeout.as_secs(),
+                    last,
+                });
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         if event.at.as_millis() > deadline {
             return Err(WaitError::Timeout {
                 instance: instance.clone(),

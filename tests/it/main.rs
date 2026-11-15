@@ -9,6 +9,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use cdct::holders::read_table;
 use cdct::{
@@ -27,7 +28,7 @@ use cwld::{
     CiJob, ClassCatalog, CleanOutcome, Clock, DirtyReason, DiscardHandoff, DiskReset,
     DisplacedHandoff, HandoffError, HandoffStatus, Hibernation, HolderHandoff, Hosts, Lifecycle,
     MemoryRule, ParseError, Runtime, RuntimeError, StepError, TransitionError, Trigger,
-    ValidationError,
+    ValidationError, WaitPolicy,
 };
 use serde_json::json;
 
@@ -198,6 +199,11 @@ struct FakeHost {
     replicas: RefCell<BTreeMap<String, u32>>,
     /// Replica reads and tenant stops in the order they happened.
     timeline: RefCell<Vec<String>>,
+    /// The event stream never yields and the stop pushes nothing (a guest that
+    /// ignores the stop request).
+    hanging: Cell<bool>,
+    /// The senders that keep a hanging stream open until the fake is dropped.
+    held: RefCell<Vec<std::sync::mpsc::Sender<Event>>>,
 }
 
 impl FakeHost {
@@ -257,6 +263,11 @@ impl FakeHost {
     }
 
     /// Push nothing: the stream ends before the instance is ready.
+    fn hanging(self) -> Self {
+        self.hanging.set(true);
+        self
+    }
+
     fn silent(self) -> Self {
         self.silent.set(true);
         self
@@ -349,6 +360,9 @@ impl HostInstances for FakeHost {
     fn stop(&self, id: &InstanceId, mode: StopMode) -> cdrv::Result<()> {
         self.record(format!("stop:{id}:{mode:?}"))?;
         self.set(id, InstanceState::Stopping);
+        if self.hanging.get() {
+            return Ok(());
+        }
         if self.stop_times_out.get() {
             self.push(id, "instance.stopping", LATE_AT);
         } else {
@@ -376,6 +390,11 @@ impl HostInstances for FakeHost {
     }
 
     fn events(&self) -> cdrv::Result<EventStream> {
+        if self.hanging.get() {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            self.held.borrow_mut().push(sender);
+            return Ok(Box::new(receiver.into_iter()));
+        }
         Ok(Box::new(DeliveredEvents {
             events: self.events.borrow().clone().into_iter(),
             states: Arc::clone(&self.states),
@@ -1170,6 +1189,64 @@ fn counted_host() -> FakeHost {
 }
 
 #[test]
+fn a_tenant_at_zero_replicas_is_neither_stopped_nor_restored() {
+    let tree = TempTree::new("replicas-zero");
+    let mut runtime = runtime(&tree);
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let host = counted_host().with_replicas("gpu-batch", 0);
+    let hosts = host_set(&host);
+    let mut spy = SpyHandoff::default();
+    let report = runtime
+        .execute_plan(&mac_plan(), &hosts, &mut event_log(), at(), &mut spy)
+        .expect("the journal is writable");
+    assert!(report.is_complete(), "{:?}", report.failed);
+    assert!(
+        !host.calls().iter().any(|call| call.contains("gpu-batch")),
+        "an idle tenant holds nothing: {:?}",
+        host.calls()
+    );
+    let recorded = spy.recorded.last().expect("the counts are recorded");
+    assert!(recorded.iter().all(|(tenant, _)| tenant != "gpu-batch"));
+    assert!(recorded.contains(&("gpu-serving".to_owned(), 3)));
+}
+
+#[test]
+fn a_stop_with_no_event_at_all_ends_at_the_deadline() {
+    // A guest that ignores the stop request pushes nothing: the wait must
+    // still end, as a stop timeout, without a destroy.
+    let tree = TempTree::new("stop-deadline");
+    let mut runtime = runtime(&tree).with_wait_policy(WaitPolicy {
+        readiness_timeout: Duration::from_millis(50),
+        stop_timeout: Duration::from_millis(50),
+    });
+    let mute = InstanceId::from("mute");
+    let host = FakeHost::new()
+        .with_state("mute", InstanceState::Running)
+        .hanging();
+    let hosts = host_set(&host);
+    let plan = SwitchPlan {
+        target: KernelOwner::Host,
+        memory: None,
+        displaced: Vec::new(),
+        steps: vec![PlanStep::StopInstance {
+            instance: mute.clone(),
+            mode: StopMode::Clean,
+        }],
+    };
+    let started = std::time::Instant::now();
+    let report = runtime
+        .execute_plan(&plan, &hosts, &mut event_log(), at(), &mut DiscardHandoff)
+        .expect("the journal is writable");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let failed = report.failed.expect("the stop times out");
+    assert!(
+        matches!(failed.error, StepError::StopTimeout { .. }),
+        "{failed:?}"
+    );
+    assert_eq!(host.destroys.get(), 0);
+}
+
+#[test]
 fn replica_counts_are_read_before_the_first_stop() {
     let tree = TempTree::new("replicas-first");
     let mut runtime = runtime(&tree);
@@ -1340,9 +1417,9 @@ fn a_full_mac_switch_hands_over_the_card_and_records_what_it_displaced() {
             "tenant-stop:gpu-batch:gpu-besteffort".to_owned(),
             "tenant-stop:gpu-serving:gpu-interactive".to_owned(),
             "tenant-stop:desktop-session:gpu-desktop".to_owned(),
+            "sunshine:guest:mac-desktop".to_owned(),
             format!("bind:{}", address(gpu_address())),
             "start:mac-desktop".to_owned(),
-            "sunshine:guest:mac-desktop".to_owned(),
         ]
     );
     assert_eq!(runtime.state(&target), Some(&InstanceState::Running));
@@ -1378,7 +1455,6 @@ fn a_full_mac_switch_hands_over_the_card_and_records_what_it_displaced() {
         vec![
             "stop:mac-desktop:Clean".to_owned(),
             format!("unbind:{}", address(gpu_address())),
-            format!("reset:{}", address(gpu_address())),
             "tenant-start:desktop-session:gpu-desktop:x1".to_owned(),
             "tenant-start:gpu-serving:gpu-interactive:x1".to_owned(),
             "tenant-start:gpu-batch:gpu-besteffort:x1".to_owned(),
@@ -1495,21 +1571,16 @@ fn a_failing_step_stops_the_plan_and_reports_what_did_not_run() {
         .expect("the journal is writable");
 
     let failed = report.failed.as_ref().expect("the handover fails");
-    assert_eq!(failed.index, 3);
+    assert_eq!(failed.index, 4);
     assert!(matches!(&failed.step, PlanStep::HandOverCard { .. }));
     assert!(matches!(failed.error, StepError::Driver { .. }));
-    assert_eq!(report.executed.len(), 3);
-    assert_eq!(report.not_run.len(), 2);
+    assert_eq!(report.executed.len(), 4);
+    assert_eq!(report.not_run.len(), 1);
     assert_eq!(
         report.not_run,
-        vec![
-            PlanStep::StartInstance {
-                instance: InstanceId::from("mac-desktop")
-            },
-            PlanStep::SunshineFollows {
-                kernel: KernelOwner::Guest(InstanceId::from("mac-desktop"))
-            },
-        ]
+        vec![PlanStep::StartInstance {
+            instance: InstanceId::from("mac-desktop")
+        }]
     );
     assert!(
         event_kinds(&report.events).contains(&"plan.step_failed"),
@@ -1788,7 +1859,7 @@ fn a_plan_without_its_ports_fails_with_a_typed_error() {
 }
 
 #[test]
-fn a_handover_resolves_the_card_name_to_every_function() {
+fn a_handover_resolves_the_card_name_and_hands_the_whole_card_over_once() {
     let tree = TempTree::new("card-functions");
     let mut runtime = runtime(&tree);
     let mac = InstanceId::from("mac-desktop");
@@ -1827,15 +1898,14 @@ fn a_handover_resolves_the_card_name_to_every_function() {
             "tenant-stop:gpu-batch:gpu-besteffort".to_owned(),
             "tenant-stop:gpu-serving:gpu-interactive".to_owned(),
             "tenant-stop:desktop-session:gpu-desktop".to_owned(),
-            format!("bind:{}", address(gpu_address())),
-            format!("bind:{}", address(audio)),
-            format!("bind:{}", address(usb)),
-            "start:mac-desktop".to_owned(),
             "sunshine:guest:mac-desktop".to_owned(),
+            format!("bind:{}", address(gpu_address())),
+            "start:mac-desktop".to_owned(),
         ]
     );
 
-    // The reverse hands back every function it took, in address order.
+    // The reverse returns the whole card once, by its GPU function, with no
+    // reset written after the host driver holds it again.
     let host = FakeHost::new()
         .with_state("mac-desktop", InstanceState::Running)
         .with_card(card());
@@ -1850,11 +1920,6 @@ fn a_handover_resolves_the_card_name_to_every_function() {
         vec![
             "stop:mac-desktop:Clean".to_owned(),
             format!("unbind:{}", address(gpu_address())),
-            format!("reset:{}", address(gpu_address())),
-            format!("unbind:{}", address(audio)),
-            format!("reset:{}", address(audio)),
-            format!("unbind:{}", address(usb)),
-            format!("reset:{}", address(usb)),
             "sunshine:host".to_owned(),
         ]
     );

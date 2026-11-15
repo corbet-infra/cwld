@@ -2,13 +2,14 @@
 //!
 //! `cdct` documents that the runtime records a plan's `displaced` tenants with
 //! the holder that took the card, so a later switch back to the host restores
-//! exactly that set. `cwld` writes it through `cdct`'s own holder store, which
-//! keeps the one-writer-per-host file lock; a plan that did not run to the end
-//! records nothing.
+//! exactly that set. While the conductor daemon runs it is the table's one
+//! writer and holds its lock for life, so [`DaemonHandoff`] asks the daemon to
+//! record the list (`record_displaced` on the local socket); [`HolderHandoff`]
+//! writes the table file directly and is for hosts without a daemon.
 
 use std::path::{Path, PathBuf};
 
-use cdct::{HolderStore, SwitchPlan};
+use cdct::{Client, Endpoint, HolderStore, SwitchPlan};
 use cdrv::InstanceId;
 use thiserror::Error;
 
@@ -62,6 +63,38 @@ impl DisplacedHandoff for HolderHandoff {
         holder.displaced = plan.displaced.clone();
         store
             .save(&table)
+            .map_err(|error| HandoffError::Store(error.to_string()))
+    }
+}
+
+/// A hand-off through the running conductor daemon, which owns the holder
+/// table: the list is sent as one `record_displaced` request on its local
+/// socket.
+#[derive(Debug, Clone)]
+pub struct DaemonHandoff {
+    endpoint: Endpoint,
+}
+
+impl DaemonHandoff {
+    /// A hand-off to the daemon listening on `socket`.
+    #[must_use]
+    pub fn new(socket: impl Into<PathBuf>) -> Self {
+        Self {
+            endpoint: Endpoint::LocalSocket(socket.into()),
+        }
+    }
+}
+
+impl DisplacedHandoff for DaemonHandoff {
+    fn record(&mut self, plan: &SwitchPlan) -> Result<(), HandoffError> {
+        if plan.target.is_host() {
+            return Err(HandoffError::HostTarget);
+        }
+        let mut client = Client::connect(&self.endpoint)
+            .map_err(|error| HandoffError::Store(error.to_string()))?;
+        client
+            .record_displaced(&plan.displaced)
+            .map(|_holder| ())
             .map_err(|error| HandoffError::Store(error.to_string()))
     }
 }

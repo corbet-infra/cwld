@@ -14,7 +14,14 @@ path = "src/lib.rs"
 name = "cwld"
 path = "src/main.rs"
 
+[features]
+default = []
+# The Linux host drivers: `cwld follow` executes the conductor's plans through
+# `clnx`. Off by default, so the runtime and its tests build on any platform.
+clnx = ["dep:clnx"]
+
 [dependencies]
+clnx = { git = "https://git.corbet.ch/corbet-infra/clnx.git", branch = "main", optional = true }
 cdct = { git = "https://git.corbet.ch/corbet-infra/cdct.git", branch = "main" }
 cdrv = { git = "https://git.corbet.ch/corbet-infra/cdrv.git", branch = "main" }
 clap = { version = "4", features = ["derive"] }

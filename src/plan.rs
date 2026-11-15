@@ -340,6 +340,10 @@ impl Runtime {
     /// The plan with every displaced tenant's live replica count filled in, after the
     /// counts were handed to the hand-off (a guest target only; a host target restores
     /// the stored counts and has nothing to read).
+    ///
+    /// A tenant read at zero replicas holds nothing on the card: it is not displaced,
+    /// its stop step is dropped, and the switch back does not start it (a start with
+    /// zero replicas is refused by the driver).
     fn count_displaced<H: DisplacedHandoff>(
         plan: &SwitchPlan,
         hosts: &Hosts<'_>,
@@ -356,6 +360,16 @@ impl Runtime {
                     message: error.to_string(),
                 })?;
         }
+        let idle: Vec<String> = counted
+            .displaced
+            .iter()
+            .filter(|displaced| displaced.replicas == 0)
+            .map(|displaced| displaced.tenant.clone())
+            .collect();
+        counted.displaced.retain(|displaced| displaced.replicas > 0);
+        counted.steps.retain(|step| {
+            !matches!(step, PlanStep::StopHostTenant { tenant, .. } if idle.contains(tenant))
+        });
         if !counted.target.is_host() {
             handoff
                 .record(&counted)
@@ -429,11 +443,17 @@ impl Runtime {
 /// Hand the card the plan names over between kernels.
 ///
 /// The plan names the card as the hardware inventory does; the inventory
-/// resolves that name to every PCI function the card presents (a graphics card
-/// is its GPU function plus the audio and USB functions beside it). Each
-/// function is unbound and reset when the card leaves a guest, and bound when
-/// it goes to one. A name that resolves to nothing is a typed error, never a
-/// guessed address.
+/// resolves that name to the PCI functions the card presents (a graphics card
+/// is its GPU function plus the audio and USB functions beside it). A name that
+/// resolves to nothing is a typed error, never a guessed address.
+///
+/// The driver hands the WHOLE card over in one call and in the proven order
+/// (audio, USB and i2c before the GPU function on the way to a guest; the GPU
+/// function first on the way back), so the card is named once, by its GPU
+/// function. There is no explicit reset: the proven return recipe has none,
+/// and a reset written after the return would hit a function the host driver
+/// already holds again. Between two guests the card stays on the passthrough
+/// driver.
 fn hand_over(
     device: &str,
     from: &KernelOwner,
@@ -441,35 +461,31 @@ fn hand_over(
     hosts: &Hosts<'_>,
 ) -> Result<(), StepError> {
     let functions = card_functions(device, hosts)?;
-    for address in &functions {
-        let label = device_label(*address);
-        if from.guest().is_some() {
+    let card = functions
+        .iter()
+        .copied()
+        .find(|address| address.function == 0)
+        .unwrap_or(functions[0]);
+    let label = device_label(card);
+    match (from.guest().is_some(), to.guest().is_some()) {
+        (false, true) => hosts
+            .devices
+            .bind_passthrough(&card)
+            .map_err(|error| StepError::Driver {
+                action: format!("bind the card {label} to passthrough"),
+                message: error.to_string(),
+            }),
+        (true, false) => {
             hosts
                 .devices
-                .unbind_passthrough(address)
+                .unbind_passthrough(&card)
                 .map_err(|error| StepError::Driver {
-                    action: format!("unbind {label} from passthrough"),
+                    action: format!("return the card {label} to the host driver"),
                     message: error.to_string(),
-                })?;
-            hosts
-                .devices
-                .reset(address)
-                .map_err(|error| StepError::Driver {
-                    action: format!("reset {label}"),
-                    message: error.to_string(),
-                })?;
+                })
         }
-        if to.guest().is_some() {
-            hosts
-                .devices
-                .bind_passthrough(address)
-                .map_err(|error| StepError::Driver {
-                    action: format!("bind {label} to passthrough"),
-                    message: error.to_string(),
-                })?;
-        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Resolve a card's inventory name to the PCI functions it presents.

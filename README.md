@@ -61,8 +61,45 @@ prints (the plan is taken from it). The dry run prints every call the driver
 would receive. A handover names the card as the hardware inventory does; the
 dry run resolves that name through its logging fake host to one synthetic PCI
 function (`0000:01:00.0`), which is printed, never used, and is not a host
-fact. Without `--dry-run` the command fails: no OS driver crate is linked in
-this iteration. Exit status: `0` complete, `2` a step failed, `1` error.
+fact. Without `--dry-run` the command fails. Exit status: `0` complete, `2` a
+step failed, `1` error.
+
+### `cwld follow` (Linux, feature `clnx`)
+
+```sh
+cargo build --release --features clnx
+cwld follow --config /etc/cwld/host.json
+```
+
+Built with the `clnx` feature, `cwld` links the Linux host drivers and
+`follow` executes on the real host: it subscribes to the conductor's local
+socket and runs every plan the conductor pushes as `granted` (a `cdct switch`
+from the CLI, a tray click). It decides nothing and polls nothing; when the
+conductor's stream ends it exits non-zero, so the service manager restarts it
+(the conductor is socket-activated). Each plan connects the drivers afresh:
+libvirt, sysfs, `modprobe`, the systemd manager that owns the desktop session
+(a container's own system bus when the session runs in one, resolved from the
+container's init pid at that moment), and Kubernetes. The live replica counts
+of the displaced tenants are recorded through the conductor
+(`record_displaced`), the table's one writer.
+
+The host file is deployment data (JSON): `host`, `conductor` (socket),
+`state_dir`, `classes` (optional class file), `libvirt_uri`, `inventory` (the
+GPU inventory the hardware layer renders: the card's name and its PCI
+functions), `host_driver`, `holder_wait_secs`, `job_timeout_secs`, `desktop`
+(`unit`, optional `container_init_procs` and `system_bus`, optional
+`sunshine_unit` when Sunshine is not part of the session), `argocd_namespace`
+and `instances` (each a `cdrv::InstanceSpec` plus an optional `clean_stop`
+command for a guest that ignores ACPI, such as macOS).
+
+The plan executor's rules on a real card: the whole card is handed over in
+one driver call in the proven order, with no explicit reset (the proven return
+recipe has none, and a reset written after the return would hit a function the
+host driver holds again); between two guests the card stays on the
+passthrough driver; a tenant read at zero replicas holds nothing and is
+neither stopped nor restored; every wait ends at its deadline even when no
+event comes (a guest that ignores the stop request ends in `Failed`, never in
+a destroy).
 
 ## How to run the tests
 

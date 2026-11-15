@@ -43,6 +43,8 @@ pub mod dispatch;
 pub mod handoff;
 pub mod journal;
 pub mod lifecycle;
+#[cfg(feature = "clnx")]
+pub mod linux;
 pub mod plan;
 pub mod ports;
 pub mod recovery;
@@ -56,7 +58,7 @@ pub use classes::{
     Persistence, ResetPolicy, ValidationError,
 };
 pub use dirty::{DirtyMark, DirtyMarks, DirtyReason};
-pub use handoff::{DiscardHandoff, DisplacedHandoff, HandoffError, HolderHandoff};
+pub use handoff::{DaemonHandoff, DiscardHandoff, DisplacedHandoff, HandoffError, HolderHandoff};
 pub use journal::{Journals, PlanJournal};
 pub use lifecycle::{Lifecycle, TransitionError, Trigger};
 pub use plan::{HandoffStatus, Hosts, PlanReport, StepError, StepFailure};

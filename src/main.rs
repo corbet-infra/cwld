@@ -40,6 +40,14 @@ enum Command {
     /// The CI dispatcher: Forgejo jobs onto clean one-job instances.
     #[command(subcommand)]
     Ci(CiCommand),
+    /// Follow the conductor on this Linux host: execute every plan it grants
+    /// through the `clnx` drivers, until its stream ends.
+    #[cfg(feature = "clnx")]
+    Follow {
+        /// The host file (JSON).
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -68,6 +76,14 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::RunPlan { plan, dry_run } => run_plan(&plan, dry_run),
+        #[cfg(feature = "clnx")]
+        Command::Follow { config } => match cwld::linux::follow(&config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("cwld: {message}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Ci(CiCommand::Check { config }) => ci_check(&config),
         Command::Ci(CiCommand::Serve { config }) => ci_serve(&config),
         Command::Ci(CiCommand::Scrub { path }) => ci_scrub(&path),
