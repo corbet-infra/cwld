@@ -304,6 +304,12 @@ impl CiConfig {
                 self.state_directory
             ));
         }
+        if !super::units::valid_slice(&self.slice) {
+            return bad(format!(
+                "slice {:?} must be a unit name ending in .slice",
+                self.slice
+            ));
+        }
         let (mut labels, mut slots) = (
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),

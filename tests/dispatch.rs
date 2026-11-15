@@ -1844,3 +1844,54 @@ fn a_job_asking_for_an_alias_of_the_pool_runs_in_it() {
     );
     assert_eq!(st.started[0].unit, format!("cwld-ci-0-{HANDLE_A}"));
 }
+
+#[test]
+fn a_dashed_slice_is_looked_up_in_its_parent_chain() {
+    use cwld::dispatch::units::{SystemdRun, UnitRunner, slice_path};
+    use std::path::PathBuf;
+    assert_eq!(slice_path("ci.slice"), PathBuf::from("ci.slice"));
+    assert_eq!(
+        slice_path("ci-srv-x.slice"),
+        PathBuf::from("ci.slice/ci-srv.slice/ci-srv-x.slice")
+    );
+    assert_eq!(slice_path("-.slice"), PathBuf::new());
+    let root = temp("cgroups-dashed");
+    let leaf = root.join("ci.slice/ci-srv.slice/cwld-ci-0-aaaa.service");
+    std::fs::create_dir_all(&leaf).expect("cgroup");
+    let runner = SystemdRun {
+        cgroup_root: root,
+        slice: "ci-srv.slice".to_owned(),
+        ..SystemdRun::default()
+    };
+    assert!(!runner.gone("cwld-ci-0-aaaa"), "the unit still runs");
+    assert!(runner.gone("cwld-ci-1-none"));
+}
+
+#[test]
+fn a_bad_slice_is_refused_at_load() {
+    let cfg = |slice: &str| {
+        format!(
+            r#"
+state_dir = "/var/lib/cwld-ci"
+slice = "{slice}"
+[forge]
+api = "https://forge.example/api/v1"
+runner_url = "https://forge.example/"
+runner_version = "v13.1.0"
+[[pool]]
+label = "linux"
+kind = "host"
+claim_mib = 1
+runner = "/bin/runner"
+template = "/etc/t.json"
+run_as = "forgejo-runner"
+slots = [{{ id = "0", name = "slot-0" }}]
+"#
+        )
+    };
+    assert!(CiConfig::parse(&cfg("ci.slice")).is_ok());
+    assert!(CiConfig::parse(&cfg("ci-srv.slice")).is_ok());
+    for bad in ["../x.slice", "x", "a/b.slice", ".slice", ""] {
+        assert!(CiConfig::parse(&cfg(bad)).is_err(), "{bad:?}");
+    }
+}

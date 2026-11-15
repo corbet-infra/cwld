@@ -110,11 +110,46 @@ impl Default for SystemdRun {
     }
 }
 
+/// The cgroup directory of a slice below the cgroup root: systemd nests a
+/// dashed name in its parents (`a-b.slice` lives in `a.slice/a-b.slice`), and
+/// `-.slice` is the root itself.
+pub fn slice_path(slice: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    let Some(stem) = slice.strip_suffix(".slice") else {
+        return PathBuf::from(slice);
+    };
+    if stem == "-" {
+        return path;
+    }
+    let mut prefix = String::new();
+    for part in stem.split('-') {
+        if !prefix.is_empty() {
+            prefix.push('-');
+        }
+        prefix.push_str(part);
+        path.push(format!("{prefix}.slice"));
+    }
+    path
+}
+
+/// Whether a configured slice name is acceptable: non-empty, `.slice`,
+/// only unit-name characters, no path parts.
+pub fn valid_slice(slice: &str) -> bool {
+    slice.len() > ".slice".len()
+        && slice.ends_with(".slice")
+        && !slice.contains("..")
+        && slice
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.@:-".contains(c))
+}
+
 impl SystemdRun {
+    fn slice_dir(&self) -> PathBuf {
+        self.cgroup_root.join(slice_path(&self.slice))
+    }
+
     fn cgroup(&self, unit: &str) -> PathBuf {
-        self.cgroup_root
-            .join(&self.slice)
-            .join(format!("{unit}.service"))
+        self.slice_dir().join(format!("{unit}.service"))
     }
 }
 
@@ -229,7 +264,7 @@ impl UnitRunner for SystemdRun {
     }
 
     fn sweep(&self, prefix: &str) -> io::Result<Vec<String>> {
-        let dir = self.cgroup_root.join(&self.slice);
+        let dir = self.slice_dir();
         let mut found = Vec::new();
         for entry in std::fs::read_dir(&dir)?.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
