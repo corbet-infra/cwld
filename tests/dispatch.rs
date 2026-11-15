@@ -1851,16 +1851,16 @@ fn a_dashed_slice_is_looked_up_in_its_parent_chain() {
     use std::path::PathBuf;
     assert_eq!(slice_path("ci.slice"), PathBuf::from("ci.slice"));
     assert_eq!(
-        slice_path("ci-srv-x.slice"),
-        PathBuf::from("ci.slice/ci-srv.slice/ci-srv-x.slice")
+        slice_path("ci-pool-x.slice"),
+        PathBuf::from("ci.slice/ci-pool.slice/ci-pool-x.slice")
     );
     assert_eq!(slice_path("-.slice"), PathBuf::new());
     let root = temp("cgroups-dashed");
-    let leaf = root.join("ci.slice/ci-srv.slice/cwld-ci-0-aaaa.service");
+    let leaf = root.join("ci.slice/ci-pool.slice/cwld-ci-0-aaaa.service");
     std::fs::create_dir_all(&leaf).expect("cgroup");
     let runner = SystemdRun {
         cgroup_root: root,
-        slice: "ci-srv.slice".to_owned(),
+        slice: "ci-pool.slice".to_owned(),
         ..SystemdRun::default()
     };
     assert!(!runner.gone("cwld-ci-0-aaaa"), "the unit still runs");
@@ -1890,7 +1890,7 @@ slots = [{{ id = "0", name = "slot-0" }}]
         )
     };
     assert!(CiConfig::parse(&cfg("ci.slice")).is_ok());
-    assert!(CiConfig::parse(&cfg("ci-srv.slice")).is_ok());
+    assert!(CiConfig::parse(&cfg("ci-pool.slice")).is_ok());
     for bad in ["../x.slice", "x", "a/b.slice", ".slice", ""] {
         assert!(CiConfig::parse(&cfg(bad)).is_err(), "{bad:?}");
     }
