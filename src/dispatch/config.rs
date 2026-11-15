@@ -1,7 +1,7 @@
 //! The dispatcher's configuration (TOML), validated at load.
 //!
 //! Nothing secret lives here: the forge credential is read from the
-//! credentials directory the deployment (`nixci`) provides.
+//! credentials directory the deployment (a separate repository) provides.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};

@@ -2,7 +2,7 @@
 //!
 //! It replaces `runner-dispatch`, `runner-slot` and `runner-vm-slot`. CI is a
 //! `cwld` class (ephemeral, one job, then reset) with the Forgejo runner
-//! inside; the deployment (`nixci`) supplies the configuration file, the unit
+//! inside; the deployment (a separate repository) supplies the configuration file, the unit
 //! properties and the registration credential. CI does not join `ccid`.
 //!
 //! | Piece | Module | Port | Production adapter |

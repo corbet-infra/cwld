@@ -381,7 +381,7 @@ impl Rig {
                 .iter()
                 .map(|s| SlotCfg {
                     id: (*s).to_owned(),
-                    name: format!("srv-{s}"),
+                    name: format!("slot-{s}"),
                 })
                 .collect(),
             factory,
@@ -872,7 +872,7 @@ fn a_start_that_fails_burns_no_registration() {
         claim_mib: 10,
         slots: vec![SlotCfg {
             id: "0".to_owned(),
-            name: "srv-0".to_owned(),
+            name: "slot-0".to_owned(),
         }],
         factory,
     };
@@ -1250,7 +1250,7 @@ fn a_registration_is_ephemeral_and_its_secrets_stay_off_the_wire_headers_it_must
     ];
     let (base, server) = fake_forge_server(routes, 2);
     let reg = client(&base)
-        .register_ephemeral(&org("orga"), "srv-0")
+        .register_ephemeral(&org("orga"), "slot-0")
         .expect("register");
     assert_eq!(reg.uuid, "11111111-1111-1111-1111-111111111111");
     assert_eq!(reg.token.expose(), "SINGLEUSE");
@@ -1262,7 +1262,7 @@ fn a_registration_is_ephemeral_and_its_secrets_stay_off_the_wire_headers_it_must
     let seen = server.join().unwrap();
     let post = &seen[1];
     assert!(post.contains(r#""ephemeral":true"#));
-    assert!(post.contains(r#""name":"srv-0""#));
+    assert!(post.contains(r#""name":"slot-0""#));
     assert!(post.contains("Connect-Protocol-Version: 1"));
     assert!(
         !post.contains("READ-SCOPE-TOKEN"),
@@ -1349,7 +1349,7 @@ claim_mib = 2048
 runner = "/bin/forgejo-runner"
 template = "/etc/runner.json"
 run_as = "forgejo-runner"
-slots = [{ id = "0", name = "srv-0" }, { id = "1", name = "srv-1" }]
+slots = [{ id = "0", name = "slot-0" }, { id = "1", name = "slot-1" }]
 "#;
     let cfg = CiConfig::parse(ok).expect("valid");
     assert_eq!(cfg.pools[0].slots.len(), 2);
@@ -1483,7 +1483,7 @@ runner = "/bin/forgejo-runner"
 template = "/etc/runner.json"
 run_as = "forgejo-runner"
 environment = { HOME = "/var/lib/forgejo-runner" }
-slots = [{ id = "0", name = "srv-0", environment = { SCCACHE_SERVER_PORT = "4230" } }]
+slots = [{ id = "0", name = "slot-0", environment = { SCCACHE_SERVER_PORT = "4230" } }]
 "#;
     assert!(CiConfig::parse(base).is_ok());
     assert!(
