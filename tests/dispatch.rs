@@ -491,7 +491,9 @@ fn a_job_runs_in_a_fresh_unit_and_leaves_nothing() {
     );
     // the runner's tree is the unit's own state directory, removed by the unit as its account
     let has = |p: String| spec.properties.contains(&p);
-    assert!(has(format!("StateDirectory=runner/slots/0 runner/cache/0")));
+    assert!(has(
+        "StateDirectory=runner/slots/0 runner/cache/0".to_owned()
+    ));
     assert!(has(format!(
         "ExecStopPost=/usr/bin/cwld ci scrub {}",
         rig.dir
