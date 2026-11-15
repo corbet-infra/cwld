@@ -17,6 +17,9 @@ report what was left half done.
   `Stopped`, `Failed`, with exactly the transitions of `CONTRACTS.md` section 6.
   An illegal transition is a typed error. `cwld` never destroys on its own, and
   a stop timeout ends in `Failed` with an event that says a human is needed.
+  Waits never poll: `cwld` reads the instance's state once, then follows the
+  lifecycle events the driver pushes, against a deadline on the contract's one
+  clock.
 - **Plan executor.** A `cdct::SwitchPlan` is data. `cwld` executes it in order,
   stops at the first failed step, emits the event and returns a typed report of
   what ran, what failed and what was never reached. A guest switch that finishes
@@ -67,11 +70,14 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-`tests/it/main.rs` is the readable specification, with a fake `cdrv` driver: a
-full Mac switch and back to the host, a Windows switch that stops the office
-profile first, a failing step in the middle, a start and a stop timeout
-(`Failed`, never a destroy), the CI job cycle including reset, crash recovery of
-a dirty ephemeral instance, half-run plan reporting, and class data validation.
+`tests/it/main.rs` is the readable specification, with a fake `cdrv` driver that
+pushes lifecycle events and a fake clock: a full Mac switch and back to the
+host, a Windows switch that stops the office profile first, a failing step in
+the middle, a start and a stop timeout (`Failed`, never a destroy), a start
+driven only by the pushed events (the state is read once, never in a loop), a
+driver failure event, an exhausted stream, the deadline on the fake clock, the
+CI job cycle including reset, crash recovery of a dirty ephemeral instance,
+half-run plan reporting, and class data validation.
 
 `Cargo.toml` patches `cdct`'s git-sourced `cdrv` to the local path so the two
 crates share one contract version; the patch goes away when `cwld` follows the

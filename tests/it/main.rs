@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cdct::holders::read_table;
 use cdct::{
@@ -15,19 +16,24 @@ use cdct::{
     SwitchPlan, TenantState, plan_switch,
 };
 use cdrv::{
-    CpuClaim, DeviceAddress, DeviceFacts, DeviceFilter, Event, EventLog, EventStream, ExecResult,
-    GuestAgent, GuestExec, GuestHealth, GuestOs, HolderId, HostDevices, HostInstances,
+    CpuClaim, DeviceAddress, DeviceFacts, DeviceFilter, Event, EventId, EventLog, EventStream,
+    ExecResult, GuestAgent, GuestExec, GuestHealth, GuestOs, HolderId, HostDevices, HostInstances,
     InstanceClass, InstanceId, InstanceKind, InstanceSpec, InstanceState, LeaseId, MemoryClaim,
-    ShutdownMode, Source, StopMode, Timestamp,
+    Severity, ShutdownMode, Source, StopMode, Subject, Timestamp,
 };
 use cwld::{
-    CiJob, ClassCatalog, CleanOutcome, DirtyReason, DiscardHandoff, DiskReset, DisplacedHandoff,
-    HandoffError, HandoffStatus, Hibernation, HolderHandoff, HostPlatform, Hosts, Lifecycle,
-    MemoryRule, NoSleeper, ParseError, Runtime, RuntimeError, StepError, TransitionError, Trigger,
+    CiJob, ClassCatalog, CleanOutcome, Clock, DirtyReason, DiscardHandoff, DiskReset,
+    DisplacedHandoff, HandoffError, HandoffStatus, Hibernation, HolderHandoff, HostPlatform, Hosts,
+    Lifecycle, MemoryRule, ParseError, Runtime, RuntimeError, StepError, TransitionError, Trigger,
     ValidationError,
 };
+use serde_json::json;
 
 const DESKTOP_MIB: u64 = 24 * 1024;
+
+/// An event later than every test deadline: the fake clock is at `at()`
+/// (1 s) and the longest class timeout is 600 s.
+const LATE_AT: u64 = 601_001;
 
 // ---------------------------------------------------------------------------
 // Fixtures: memory facts and the observed GPU state
@@ -166,15 +172,24 @@ fn back_plan(displaced: &[DisplacedTenant]) -> SwitchPlan {
 // The fake `cdrv` driver
 // ---------------------------------------------------------------------------
 
-/// A fake host driver that records every call and can be told to fail one.
+/// A fake host driver that records every call, pushes lifecycle events and can
+/// be told to fail one.
+///
+/// `start` and `stop` return while the transition is still in flight, as the
+/// `cdrv` contract says, and push the event that completes it; the runtime must
+/// follow the events, not the state.
 #[derive(Default)]
 struct FakeHost {
-    states: RefCell<BTreeMap<String, InstanceState>>,
+    states: Arc<Mutex<BTreeMap<String, InstanceState>>>,
+    events: RefCell<Vec<Event>>,
     calls: RefCell<Vec<String>>,
     fail_prefix: RefCell<Option<String>>,
     destroys: Cell<u32>,
+    state_reads: Cell<u32>,
     stop_times_out: Cell<bool>,
     never_ready: Cell<bool>,
+    start_fails: Cell<bool>,
+    silent: Cell<bool>,
 }
 
 impl FakeHost {
@@ -183,7 +198,12 @@ impl FakeHost {
     }
 
     fn with_state(self, id: &str, state: InstanceState) -> Self {
-        self.states.borrow_mut().insert(id.to_owned(), state);
+        self.set(&InstanceId::from(id), state);
+        self
+    }
+
+    fn with_event(self, event: Event) -> Self {
+        self.events.borrow_mut().push(event);
         self
     }
 
@@ -202,13 +222,25 @@ impl FakeHost {
         self
     }
 
+    fn start_fails(self) -> Self {
+        self.start_fails.set(true);
+        self
+    }
+
+    /// Push nothing: the stream ends before the instance is ready.
+    fn silent(self) -> Self {
+        self.silent.set(true);
+        self
+    }
+
     fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
     }
 
     fn set(&self, id: &InstanceId, state: InstanceState) {
         self.states
-            .borrow_mut()
+            .lock()
+            .expect("the fake state lock")
             .insert(id.as_str().to_owned(), state);
     }
 
@@ -225,13 +257,34 @@ impl FakeHost {
         }
         Ok(())
     }
+
+    fn push(&self, id: &InstanceId, kind: &str, at_ms: u64) {
+        self.push_with(id, kind, at_ms, json!({}));
+    }
+
+    fn push_with(&self, id: &InstanceId, kind: &str, at_ms: u64, data: serde_json::Value) {
+        let seq = u64::try_from(self.events.borrow().len()).unwrap_or(u64::MAX);
+        self.events.borrow_mut().push(Event {
+            id: EventId(format!("test-host/{seq}")),
+            at: Timestamp::from_millis(at_ms),
+            host: "test-host".to_owned(),
+            source: Source::Clnx,
+            kind: kind.to_owned(),
+            subject: Subject::Instance(id.clone()),
+            severity: Severity::Info,
+            seq,
+            data,
+            trace: None,
+        });
+    }
 }
 
 impl HostInstances for FakeHost {
     fn list(&self) -> cdrv::Result<Vec<(InstanceId, InstanceState)>> {
         Ok(self
             .states
-            .borrow()
+            .lock()
+            .expect("the fake state lock")
             .iter()
             .map(|(id, state)| (InstanceId::from(id.as_str()), state.clone()))
             .collect())
@@ -245,23 +298,33 @@ impl HostInstances for FakeHost {
 
     fn start(&self, id: &InstanceId) -> cdrv::Result<()> {
         self.record(format!("start:{id}"))?;
-        let state = if self.never_ready.get() {
-            InstanceState::Starting
+        self.set(id, InstanceState::Starting);
+        if self.silent.get() {
+            return Ok(());
+        }
+        if self.start_fails.get() {
+            self.push_with(
+                id,
+                "instance.failed",
+                at().as_millis(),
+                json!({"detail": "the guest did not boot"}),
+            );
+        } else if self.never_ready.get() {
+            self.push(id, "instance.starting", LATE_AT);
         } else {
-            InstanceState::Running
-        };
-        self.set(id, state);
+            self.push(id, "instance.running", at().as_millis());
+        }
         Ok(())
     }
 
     fn stop(&self, id: &InstanceId, mode: StopMode) -> cdrv::Result<()> {
         self.record(format!("stop:{id}:{mode:?}"))?;
-        let state = if self.stop_times_out.get() {
-            InstanceState::Stopping
+        self.set(id, InstanceState::Stopping);
+        if self.stop_times_out.get() {
+            self.push(id, "instance.stopping", LATE_AT);
         } else {
-            InstanceState::Stopped
-        };
-        self.set(id, state);
+            self.push(id, "instance.stopped", at().as_millis());
+        }
         Ok(())
     }
 
@@ -273,16 +336,64 @@ impl HostInstances for FakeHost {
     }
 
     fn state(&self, id: &InstanceId) -> cdrv::Result<InstanceState> {
+        self.state_reads.set(self.state_reads.get() + 1);
         Ok(self
             .states
-            .borrow()
+            .lock()
+            .expect("the fake state lock")
             .get(id.as_str())
             .cloned()
             .unwrap_or(InstanceState::Defined))
     }
 
     fn events(&self) -> cdrv::Result<EventStream> {
-        Ok(Box::new(std::iter::empty()))
+        Ok(Box::new(DeliveredEvents {
+            events: self.events.borrow().clone().into_iter(),
+            states: Arc::clone(&self.states),
+        }))
+    }
+}
+
+/// The fake driver's event stream: as it delivers an event, the state it
+/// reports becomes the state the driver answers with.
+struct DeliveredEvents {
+    events: std::vec::IntoIter<Event>,
+    states: Arc<Mutex<BTreeMap<String, InstanceState>>>,
+}
+
+impl Iterator for DeliveredEvents {
+    type Item = Event;
+
+    fn next(&mut self) -> Option<Event> {
+        let event = self.events.next()?;
+        if let (Subject::Instance(id), Some(state)) = (&event.subject, reported_state(&event)) {
+            self.states
+                .lock()
+                .expect("the fake state lock")
+                .insert(id.as_str().to_owned(), state);
+        }
+        Some(event)
+    }
+}
+
+/// The state a pushed lifecycle event reports, as the fake driver understands
+/// it; the runtime is specified against the same vocabulary.
+fn reported_state(event: &Event) -> Option<InstanceState> {
+    match event.kind.as_str() {
+        "instance.defined" => Some(InstanceState::Defined),
+        "instance.starting" => Some(InstanceState::Starting),
+        "instance.running" => Some(InstanceState::Running),
+        "instance.stopping" => Some(InstanceState::Stopping),
+        "instance.stopped" => Some(InstanceState::Stopped),
+        "instance.failed" => Some(InstanceState::Failed(
+            event
+                .data
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the driver reported a failure")
+                .to_owned(),
+        )),
+        _ => None,
     }
 }
 
@@ -399,15 +510,46 @@ fn event_log() -> EventLog {
     EventLog::new("test-host", Source::Cwld, 1)
 }
 
+/// One lifecycle event a driver would push.
+fn event_for(id: &str, kind: &str, at_ms: u64) -> Event {
+    Event {
+        id: EventId(format!("test-host/{at_ms}")),
+        at: Timestamp::from_millis(at_ms),
+        host: "test-host".to_owned(),
+        source: Source::Clnx,
+        kind: kind.to_owned(),
+        subject: Subject::Instance(InstanceId::from(id)),
+        severity: Severity::Info,
+        seq: at_ms,
+        data: json!({}),
+        trace: None,
+    }
+}
+
 fn at() -> Timestamp {
     Timestamp::from_millis(1_000)
 }
 
+/// A clock frozen at one instant, so a test places the deadline exactly.
+struct FakeClock {
+    now: Timestamp,
+}
+
+impl Clock for FakeClock {
+    fn now(&mut self) -> Timestamp {
+        self.now
+    }
+}
+
 fn runtime(tree: &TempTree) -> Runtime {
+    runtime_at(tree, at())
+}
+
+fn runtime_at(tree: &TempTree, now: Timestamp) -> Runtime {
     Runtime::new(tree.path(), ClassCatalog::defaults())
         .expect("the state directory opens")
         .with_gpu(gpu_address())
-        .with_sleeper(Box::new(NoSleeper))
+        .with_clock(Box::new(FakeClock { now }))
 }
 
 fn host_set(host: &FakeHost) -> Hosts<'_> {
@@ -1137,13 +1279,169 @@ fn a_readiness_timeout_fails_the_start() {
         .execute_plan(&plan, &hosts, &mut log, at(), &mut DiscardHandoff)
         .expect("the journal is writable");
     let failed = report.failed.as_ref().expect("the start times out");
-    assert!(matches!(failed.error, StepError::ReadinessTimeout { .. }));
+    assert!(matches!(
+        failed.error,
+        StepError::ReadinessTimeout {
+            timeout_secs: 300,
+            ..
+        }
+    ));
     assert!(matches!(
         runtime.state(&InstanceId::from("mac-desktop")),
         Some(InstanceState::Failed(_))
     ));
     assert!(event_kinds(&report.events).contains(&"instance.failed"));
     assert_eq!(host.destroys.get(), 0);
+    assert_eq!(
+        host.state_reads.get(),
+        2,
+        "one observation and one read before the stream; the wait never polls"
+    );
+}
+
+#[test]
+fn a_start_follows_the_pushed_events_and_reads_the_state_once() {
+    let tree = TempTree::new("pushed-events");
+    let mut runtime = runtime(&tree);
+    let mac = InstanceId::from("mac-desktop");
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    // Events for another instance and an intermediate state are ignored; only
+    // the pushed `instance.running` completes the start.
+    let host = FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Defined)
+        .with_event(event_for("other-vm", "instance.running", 1_050))
+        .with_event(event_for("mac-desktop", "instance.starting", 1_100));
+    let hosts = host_set(&host);
+    let plan = SwitchPlan {
+        target: KernelOwner::Guest(mac.clone()),
+        memory: None,
+        displaced: Vec::new(),
+        steps: vec![PlanStep::StartInstance {
+            instance: mac.clone(),
+        }],
+    };
+    let mut log = event_log();
+    let report = runtime
+        .execute_plan(&plan, &hosts, &mut log, at(), &mut DiscardHandoff)
+        .expect("the journal is writable");
+
+    assert!(report.is_complete());
+    assert_eq!(runtime.state(&mac), Some(&InstanceState::Running));
+    assert_eq!(host.calls(), vec!["start:mac-desktop".to_owned()]);
+    assert_eq!(
+        host.state_reads.get(),
+        2,
+        "the state is read once for the observation and once before the stream"
+    );
+}
+
+#[test]
+fn a_driver_failure_event_fails_the_start() {
+    let tree = TempTree::new("failed-event");
+    let mut runtime = runtime(&tree);
+    let mac = InstanceId::from("mac-desktop");
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let host = FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Defined)
+        .start_fails();
+    let hosts = host_set(&host);
+    let plan = SwitchPlan {
+        target: KernelOwner::Guest(mac.clone()),
+        memory: None,
+        displaced: Vec::new(),
+        steps: vec![PlanStep::StartInstance {
+            instance: mac.clone(),
+        }],
+    };
+    let mut log = event_log();
+    let report = runtime
+        .execute_plan(&plan, &hosts, &mut log, at(), &mut DiscardHandoff)
+        .expect("the journal is writable");
+
+    let failed = report.failed.expect("the driver's failure ends the start");
+    assert!(matches!(
+        &failed.error,
+        StepError::ObservedFailed { during: "starting", reason, .. }
+            if reason == "the guest did not boot"
+    ));
+    assert_eq!(
+        runtime.state(&mac),
+        Some(&InstanceState::Failed("the guest did not boot".to_owned()))
+    );
+    assert_eq!(host.state_reads.get(), 2);
+}
+
+#[test]
+fn an_ended_event_stream_is_a_driver_error() {
+    let tree = TempTree::new("ended-stream");
+    let mut runtime = runtime(&tree);
+    let mac = InstanceId::from("mac-desktop");
+    runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let host = FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Defined)
+        .silent();
+    let hosts = host_set(&host);
+    let plan = SwitchPlan {
+        target: KernelOwner::Guest(mac.clone()),
+        memory: None,
+        displaced: Vec::new(),
+        steps: vec![PlanStep::StartInstance {
+            instance: mac.clone(),
+        }],
+    };
+    let mut log = event_log();
+    let report = runtime
+        .execute_plan(&plan, &hosts, &mut log, at(), &mut DiscardHandoff)
+        .expect("the journal is writable");
+
+    let failed = report.failed.expect("an exhausted stream fails the start");
+    assert!(matches!(failed.error, StepError::Driver { .. }));
+}
+
+#[test]
+fn the_deadline_is_measured_on_the_clock_the_events_share() {
+    // `never_ready` pushes `instance.starting` at `LATE_AT` (601 s).
+    let late = TempTree::new("late-clock");
+    let mut late_runtime = runtime(&late);
+    let mac = InstanceId::from("mac-desktop");
+    late_runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let host = FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Defined)
+        .never_ready();
+    let hosts = host_set(&host);
+    let plan = SwitchPlan {
+        target: KernelOwner::Guest(mac.clone()),
+        memory: None,
+        displaced: Vec::new(),
+        steps: vec![PlanStep::StartInstance {
+            instance: mac.clone(),
+        }],
+    };
+    let mut log = event_log();
+    let report = late_runtime
+        .execute_plan(&plan, &hosts, &mut log, at(), &mut DiscardHandoff)
+        .expect("the journal is writable");
+    assert!(matches!(
+        report.failed.expect("late event").error,
+        StepError::ReadinessTimeout { .. }
+    ));
+
+    // The same stream is not late for a clock whose deadline is beyond it, so
+    // the wait ends with the driver's stream, not a timeout.
+    let early = TempTree::new("early-clock");
+    let mut early_runtime = runtime_at(&early, Timestamp::from_millis(400_000));
+    early_runtime.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
+    let host = FakeHost::new()
+        .with_state("mac-desktop", InstanceState::Defined)
+        .never_ready();
+    let hosts = host_set(&host);
+    let report = early_runtime
+        .execute_plan(&plan, &hosts, &mut log, at(), &mut DiscardHandoff)
+        .expect("the journal is writable");
+    assert!(matches!(
+        report.failed.expect("the stream ends").error,
+        StepError::Driver { .. }
+    ));
 }
 
 #[test]
@@ -1178,6 +1476,11 @@ fn a_stop_timeout_ends_failed_and_never_destroys() {
     assert_eq!(human.data["needs_human"], true);
     assert_eq!(human.severity, cdrv::Severity::Error);
     assert!(!host.calls().iter().any(|call| call.starts_with("unbind:")));
+    assert_eq!(
+        host.state_reads.get(),
+        2,
+        "the stop wait follows events, it does not poll the state"
+    );
 }
 
 #[test]
@@ -1204,7 +1507,7 @@ fn a_plan_without_its_ports_fails_with_a_typed_error() {
     // A handover without a GPU address is refused, not invented.
     let mut bare = Runtime::new(tree.path(), ClassCatalog::defaults())
         .expect("the state directory opens")
-        .with_sleeper(Box::new(NoSleeper));
+        .with_clock(Box::new(FakeClock { now: at() }));
     bare.register(spec("mac-desktop", InstanceClass::Desktop, GuestOs::MacOs));
     let host = FakeHost::new().with_state("mac-desktop", InstanceState::Defined);
     let hosts = host_set(&host);
@@ -1244,7 +1547,7 @@ fn a_ci_job_runs_clean_start_exec_stop_and_reset() {
         .expect("the CI class rules allow the job");
 
     assert!(report.started);
-    assert!(report.stopped);
+    assert!(report.stopped, "the stop failed: {:?}", report.failure);
     assert!(report.reset);
     assert!(report.failure.is_none());
     assert_eq!(report.exec.expect("the command ran").status, 0);

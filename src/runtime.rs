@@ -24,7 +24,7 @@ use crate::journal::Journals;
 use crate::lifecycle::{Lifecycle, TransitionError, Trigger};
 use crate::plan::{Hosts, StepError};
 use crate::store::StoreError;
-use crate::wait::{RealSleeper, Sleeper, WaitError, WaitPolicy, wait_for};
+use crate::wait::{Clock, SystemClock, WaitError, WaitPolicy, wait_for};
 
 /// A runtime failure that is not a failed plan step.
 #[derive(Debug, Error)]
@@ -113,7 +113,7 @@ pub struct Runtime {
     journals: Journals,
     specs: BTreeMap<InstanceId, InstanceSpec>,
     lifecycles: BTreeMap<InstanceId, Lifecycle>,
-    sleeper: Box<dyn Sleeper>,
+    clock: Box<dyn Clock>,
 }
 
 impl Runtime {
@@ -128,7 +128,7 @@ impl Runtime {
             journals: Journals::new(root.join("plans"))?,
             specs: BTreeMap::new(),
             lifecycles: BTreeMap::new(),
-            sleeper: Box::new(RealSleeper),
+            clock: Box::new(SystemClock),
         })
     }
 
@@ -139,10 +139,10 @@ impl Runtime {
         self
     }
 
-    /// Replace the sleeper the waits use.
+    /// Replace the clock the wait deadlines are measured on.
     #[must_use]
-    pub fn with_sleeper(mut self, sleeper: Box<dyn Sleeper>) -> Self {
-        self.sleeper = sleeper;
+    pub fn with_clock(mut self, clock: Box<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -386,7 +386,6 @@ impl Runtime {
                 action: format!("start {instance}"),
                 message: error.to_string(),
             })?;
-        let interval = self.wait.poll_interval;
         let timeout = self.readiness_timeout_for(instance);
         match wait_for(
             hosts.instances,
@@ -394,8 +393,7 @@ impl Runtime {
             "running",
             |state| matches!(state, InstanceState::Running),
             timeout,
-            interval,
-            self.sleeper.as_mut(),
+            self.clock.as_mut(),
         ) {
             Ok(_) => {
                 if let Some(event) =
@@ -435,6 +433,10 @@ impl Runtime {
                     reason,
                 })
             }
+            Err(error @ WaitError::Ended { .. }) => Err(StepError::Driver {
+                action: format!("follow the events of {instance}"),
+                message: error.to_string(),
+            }),
             Err(WaitError::Driver { message, .. }) => Err(StepError::Driver {
                 action: format!("read the state of {instance}"),
                 message,
@@ -505,7 +507,6 @@ impl Runtime {
                 action: format!("stop {instance}"),
                 message: error.to_string(),
             })?;
-        let interval = self.wait.poll_interval;
         let timeout = self.stop_timeout_for(instance);
         match wait_for(
             hosts.instances,
@@ -513,8 +514,7 @@ impl Runtime {
             "stopped",
             |state| matches!(state, InstanceState::Stopped),
             timeout,
-            interval,
-            self.sleeper.as_mut(),
+            self.clock.as_mut(),
         ) {
             Ok(_) => {
                 if self.state(instance) == Some(&InstanceState::Stopping) {
@@ -575,6 +575,10 @@ impl Runtime {
                     reason,
                 })
             }
+            Err(error @ WaitError::Ended { .. }) => Err(StepError::Driver {
+                action: format!("follow the events of {instance}"),
+                message: error.to_string(),
+            }),
             Err(WaitError::Driver { message, .. }) => Err(StepError::Driver {
                 action: format!("read the state of {instance}"),
                 message,

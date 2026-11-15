@@ -16,7 +16,7 @@ use cdrv::{
     InstanceId, InstanceSpec, InstanceState, Source, StopMode, Timestamp,
 };
 use clap::{Parser, Subcommand};
-use cwld::{ClassCatalog, DiscardHandoff, DiskReset, HostPlatform, Hosts, NoSleeper, Runtime};
+use cwld::{ClassCatalog, DiscardHandoff, DiskReset, HostPlatform, Hosts, Runtime};
 
 /// The workload runtime: executes what the conductor decided.
 #[derive(Debug, Parser)]
@@ -63,8 +63,8 @@ fn run_plan(path: &Path, dry_run: bool, gpu: DeviceAddress) -> ExitCode {
         }
     };
     let state = std::env::temp_dir().join(format!("cwld-dry-run-{}", std::process::id()));
-    let runtime = Runtime::new(&state, ClassCatalog::defaults())
-        .map(|runtime| runtime.with_gpu(gpu).with_sleeper(Box::new(NoSleeper)));
+    let runtime =
+        Runtime::new(&state, ClassCatalog::defaults()).map(|runtime| runtime.with_gpu(gpu));
     let mut runtime = match runtime {
         Ok(runtime) => runtime,
         Err(error) => {

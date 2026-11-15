@@ -62,4 +62,4 @@ pub use ports::{DiskReset, HostPlatform};
 pub use recovery::{DirtyReport, HalfRunPlan, RecoveryReport};
 pub use runtime::{CleanOutcome, Runtime, RuntimeError};
 pub use store::StoreError;
-pub use wait::{NoSleeper, RealSleeper, Sleeper, WaitError, WaitPolicy};
+pub use wait::{Clock, SystemClock, WaitError, WaitPolicy};
