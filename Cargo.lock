@@ -167,7 +167,7 @@ dependencies = [
 [[package]]
 name = "cdrv"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-infra/cdrv.git?branch=main#a83bdf5695b7d4566bfd4f526c65a96dac13176c"
+source = "git+https://git.corbet.ch/corbet-infra/cdrv.git?branch=main#e0576542c8f3dbf913fa5a21d456927c5c86fe73"
 dependencies = [
  "serde",
  "serde_json",
@@ -228,7 +228,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "clnx"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-infra/clnx.git?branch=main#656c3321e4aae43e07a302ca906b023df3c67da7"
+source = "git+https://git.corbet.ch/corbet-infra/clnx.git?branch=main#37937320f098567434400c1d9326c8d8163fea95"
 dependencies = [
  "cdrv",
  "futures",
@@ -375,7 +375,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1183,7 +1183,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1240,7 +1240,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1535,7 +1535,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1908,7 +1908,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

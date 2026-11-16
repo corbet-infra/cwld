@@ -246,6 +246,7 @@ fn rig(guest: &Arc<FakeGuest>) -> (RuntimeVmDriver<FakeHost>, Arc<FakeHost>) {
         nic: None,
         console: false,
         identity: None,
+        on_reboot: None,
     });
     let host = Arc::new(FakeHost::default());
     lock(&host.states).insert("ci-win-0".to_owned(), InstanceState::Defined);

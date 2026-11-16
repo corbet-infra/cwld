@@ -688,6 +688,7 @@ fn spec(id: &str, class: InstanceClass, guest_os: GuestOs) -> InstanceSpec {
         nic: None,
         console: false,
         identity: None,
+        on_reboot: None,
     }
 }
 

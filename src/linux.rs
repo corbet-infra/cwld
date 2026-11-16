@@ -12,6 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use cdct::{Client, Endpoint, Reply, Request, SwitchPlan};
@@ -24,7 +25,8 @@ use clnx::{
 use serde::Deserialize;
 
 use crate::classes::ClassCatalog;
-use crate::handoff::DaemonHandoff;
+use crate::guest_stop::{GuestStopReaction, GuestStops, restart_plan};
+use crate::handoff::{DaemonHandoff, DiscardHandoff};
 use crate::plan::{Hosts, PlanReport};
 use crate::runtime::Runtime;
 use crate::wait::{Clock, SystemClock};
@@ -362,6 +364,7 @@ fn execute(
     runtime: &mut Runtime,
     config: &HostConfig,
     plan: &SwitchPlan,
+    record: bool,
 ) -> Result<PlanReport, String> {
     let (name, functions) = Inventory::load(&config.inventory)?;
     let libvirt = RealLibvirt::connect(&config.libvirt_uri).map_err(|error| error.to_string())?;
@@ -430,11 +433,16 @@ fn execute(
     );
     let hosts = Hosts::new(&instances, &devices).with_gpu(&gpu);
     let mut log = EventLog::new(config.host.clone(), Source::Cwld, 1);
-    let mut handoff = DaemonHandoff::new(&config.conductor);
     let at: Timestamp = SystemClock.now();
-    runtime
-        .execute_plan(plan, &hosts, &mut log, at, &mut handoff)
-        .map_err(|error| format!("the plan journal could not be written: {error}"))
+    let outcome = if record {
+        let mut handoff = DaemonHandoff::new(&config.conductor);
+        runtime.execute_plan(plan, &hosts, &mut log, at, &mut handoff)
+    } else {
+        // A rebooted guest started again: the conductor's holder (and the
+        // tenants it displaced) stay exactly as they are.
+        runtime.execute_plan(plan, &hosts, &mut log, at, &mut DiscardHandoff)
+    };
+    outcome.map_err(|error| format!("the plan journal could not be written: {error}"))
 }
 
 fn report(report: &PlanReport) {
@@ -580,36 +588,216 @@ pub fn follow(path: &Path) -> Result<(), String> {
         "cwld: following the conductor at {}",
         config.conductor.display()
     );
-    while let Some(reply) = client
-        .receive()
-        .map_err(|error| format!("the conductor stream failed: {error}"))?
+    // One input queue, one consumer: the conductor's pushes, the guests'
+    // lifecycle stops and QEMU's shutdown reasons. A plan runs to its end before
+    // the next input is read, so the stops a plan makes are known when their
+    // events are handled.
+    let (sender, inputs) = mpsc::channel::<Input>();
     {
-        if let Reply::Granted { plan } = reply {
-            println!(
-                "cwld: granted: switch the card to {} ({} step(s))",
-                plan.target,
-                plan.steps.len()
-            );
-            busy.store(true, Ordering::SeqCst);
-            match execute(&mut runtime, &config, &plan) {
-                Ok(done) => {
-                    report(&done);
-                    if done.is_complete() {
-                        complete(&config.conductor, &plan);
+        let sender = sender.clone();
+        std::thread::Builder::new()
+            .name("cwld-conductor".to_owned())
+            .spawn(move || {
+                loop {
+                    let reply = client.receive();
+                    let end = !matches!(reply, Ok(Some(_)));
+                    if sender
+                        .send(Input::Conductor(reply.map_err(|e| e.to_string())))
+                        .is_err()
+                        || end
+                    {
+                        return;
                     }
                 }
-                Err(message) => eprintln!(
-                    "cwld: the plan to {} was NOT started: {message}",
-                    plan.target
-                ),
+            })
+            .map_err(|error| format!("cannot start the conductor reader: {error}"))?;
+    }
+    let guests: Vec<String> = config
+        .instances
+        .iter()
+        .map(|entry| entry.spec.id.as_str().to_owned())
+        .collect();
+    if !guests.is_empty() {
+        watch_guests(&config.libvirt_uri, &guests, &sender)?;
+    }
+    drop(sender);
+    let mut stops = GuestStops::default();
+    // Inputs read while waiting for a stop's reason, handled next.
+    let mut pending: std::collections::VecDeque<Input> = std::collections::VecDeque::new();
+    loop {
+        let input = match pending.pop_front() {
+            Some(input) => input,
+            None => match inputs.recv() {
+                Ok(input) => input,
+                Err(_) => break,
+            },
+        };
+        match input {
+            Input::Conductor(Ok(Some(Reply::Granted { plan }))) => {
+                println!(
+                    "cwld: granted: switch the card to {} ({} step(s))",
+                    plan.target,
+                    plan.steps.len()
+                );
+                busy.store(true, Ordering::SeqCst);
+                match execute(&mut runtime, &config, &plan, true) {
+                    Ok(done) => {
+                        report(&done);
+                        stops.plan_stopped(&done.executed);
+                        if done.is_complete() {
+                            complete(&config.conductor, &plan);
+                        }
+                    }
+                    Err(message) => eprintln!(
+                        "cwld: the plan to {} was NOT started: {message}",
+                        plan.target
+                    ),
+                }
+                busy.store(false, Ordering::SeqCst);
+                if stopping.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
             }
-            busy.store(false, Ordering::SeqCst);
-            if stopping.load(Ordering::SeqCst) {
-                return Ok(());
+            Input::Conductor(Ok(Some(_))) => {}
+            Input::Conductor(Ok(None)) => break,
+            Input::Conductor(Err(error)) => {
+                return Err(format!("the conductor stream failed: {error}"));
+            }
+            Input::Shutdown { domain, reset } => stops.shutdown(&domain, reset),
+            Input::Stopped(domain) => {
+                let owner = conductor_owner(&config.conductor);
+                let owns = owner
+                    .as_ref()
+                    .and_then(|owner| owner.guest())
+                    .is_some_and(|guest| guest.as_str() == domain);
+                // QEMU's reason and the stop come from two event clients: give
+                // the reason a moment to arrive (bounded; it precedes the stop).
+                if owns && !stops.knows_reason(&domain) {
+                    let deadline = std::time::Instant::now() + REASON_WAIT;
+                    while let Some(left) =
+                        deadline.checked_duration_since(std::time::Instant::now())
+                    {
+                        match inputs.recv_timeout(left) {
+                            Ok(Input::Shutdown {
+                                domain: about,
+                                reset,
+                            }) if about == domain => {
+                                stops.shutdown(&about, reset);
+                                break;
+                            }
+                            Ok(other) => pending.push_back(other),
+                            Err(_) => break,
+                        }
+                    }
+                }
+                match stops.stopped(&domain, owns) {
+                    GuestStopReaction::Ignore => {}
+                    GuestStopReaction::Restart => {
+                        println!(
+                            "cwld: {domain} rebooted from inside: starting it again, the card stays with it"
+                        );
+                        let Some(owner) = owner else { continue };
+                        let plan = restart_plan(owner, cdrv::InstanceId::from(domain.as_str()));
+                        busy.store(true, Ordering::SeqCst);
+                        match execute(&mut runtime, &config, &plan, false) {
+                            Ok(done) => report(&done),
+                            Err(message) => {
+                                eprintln!("cwld: {domain} was NOT started again: {message}")
+                            }
+                        }
+                        busy.store(false, Ordering::SeqCst);
+                        if stopping.load(Ordering::SeqCst) {
+                            return Ok(());
+                        }
+                    }
+                    GuestStopReaction::ReturnToHost => {
+                        println!(
+                            "cwld: {domain} was shut down from inside: asking the conductor to return the card to the host"
+                        );
+                        match Client::connect(&Endpoint::LocalSocket(config.conductor.clone()))
+                            .and_then(|mut asker| asker.switch(&cdrv::KernelOwner::Host))
+                        {
+                            Ok(reply) => {
+                                println!("cwld: the conductor answered the return: {reply:?}")
+                            }
+                            Err(error) => {
+                                eprintln!("cwld: the return to the host was not granted: {error}")
+                            }
+                        }
+                    }
+                }
             }
         }
     }
     Err("the conductor closed the stream".to_owned())
+}
+
+/// How long a stopped guest's QEMU shutdown reason may lag behind its stop.
+const REASON_WAIT: Duration = Duration::from_secs(3);
+
+/// What the follow loop reads.
+enum Input {
+    /// A push from the conductor (`None`: the stream ended).
+    Conductor(Result<Option<Reply>, String>),
+    /// A configured guest's domain stopped.
+    Stopped(String),
+    /// QEMU's shutdown reason for a domain (`reset`: a reboot from inside).
+    Shutdown { domain: String, reset: bool },
+}
+
+/// The card's owner as the conductor names it now; `None` when it cannot be asked.
+fn conductor_owner(conductor: &Path) -> Option<cdrv::KernelOwner> {
+    Client::connect(&Endpoint::LocalSocket(conductor.to_path_buf()))
+        .and_then(|mut client| client.status())
+        .map(|status| status.owner)
+        .ok()
+}
+
+/// Stream the configured guests' stops and QEMU's shutdown reasons into the
+/// follow loop (libvirt's own event clients; nothing polls).
+fn watch_guests(uri: &str, guests: &[String], sender: &mpsc::Sender<Input>) -> Result<(), String> {
+    use clnx::DomainEventSource;
+    let lifecycle = clnx::VirshEvents::new(uri)
+        .subscribe()
+        .map_err(|error| error.to_string())?;
+    let reasons = clnx::QemuShutdownEvents::new(uri)
+        .subscribe()
+        .map_err(|error| error.to_string())?;
+    let known = guests.to_vec();
+    let to_loop = sender.clone();
+    std::thread::Builder::new()
+        .name("cwld-guest-stops".to_owned())
+        .spawn(move || {
+            for event in lifecycle {
+                if known.contains(&event.domain)
+                    && matches!(event.kind, clnx::DomainEventKind::Stopped(_))
+                    && to_loop.send(Input::Stopped(event.domain)).is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .map_err(|error| format!("cannot start the guest stop reader: {error}"))?;
+    let known = guests.to_vec();
+    let to_loop = sender.clone();
+    std::thread::Builder::new()
+        .name("cwld-guest-reasons".to_owned())
+        .spawn(move || {
+            for event in reasons {
+                if known.contains(&event.domain)
+                    && to_loop
+                        .send(Input::Shutdown {
+                            domain: event.domain,
+                            reset: event.reset,
+                        })
+                        .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .map_err(|error| format!("cannot start the guest reason reader: {error}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

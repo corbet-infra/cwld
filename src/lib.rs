@@ -40,6 +40,7 @@ pub mod ci;
 pub mod classes;
 pub mod dirty;
 pub mod dispatch;
+pub mod guest_stop;
 pub mod handoff;
 pub mod journal;
 #[cfg(feature = "clnx")]
