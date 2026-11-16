@@ -718,6 +718,7 @@ mod tests {
 /// The host side of the instance reconcile: clnx renders, libvirt defines.
 struct HostDomains {
     instances: LinuxInstances<RealLibvirt, clnx::ProcessRunner>,
+    print: bool,
 }
 
 impl crate::reconcile::Domains for HostDomains {
@@ -750,15 +751,19 @@ impl crate::reconcile::Domains for HostDomains {
 /// # Errors
 ///
 /// The host file or libvirt cannot be used, or an instance could not be reconciled.
-pub fn reconcile_instances(path: &Path) -> Result<(), String> {
+/// `dry_run` defines nothing and records nothing; `print` writes each rendered definition to stdout.
+pub fn reconcile_instances(path: &Path, dry_run: bool, print: bool) -> Result<(), String> {
     let config = HostConfig::load(path)?;
     let libvirt = RealLibvirt::connect(&config.libvirt_uri).map_err(|error| error.to_string())?;
     let instances = LinuxInstances::new(config.host.clone(), libvirt, config.render_options()?);
     let specs: Vec<InstanceSpec> = config.instances.iter().map(|e| e.spec.clone()).collect();
     let mut failed = 0;
-    for (id, outcome) in
-        crate::reconcile::reconcile(&HostDomains { instances }, &specs, &config.state_dir)
-    {
+    for (id, outcome) in crate::reconcile::reconcile(
+        &HostDomains { instances, print },
+        &specs,
+        &config.state_dir,
+        !dry_run,
+    ) {
         println!("{id}: {}", outcome.describe());
         if matches!(outcome, crate::reconcile::Outcome::Failed(_)) {
             failed += 1;

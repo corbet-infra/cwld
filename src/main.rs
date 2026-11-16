@@ -56,6 +56,12 @@ enum Command {
         /// The host file (JSON).
         #[arg(long)]
         config: PathBuf,
+        /// Say what would happen; define and record nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print each rendered domain definition.
+        #[arg(long)]
+        print: bool,
     },
 }
 
@@ -94,7 +100,11 @@ fn main() -> ExitCode {
             }
         },
         #[cfg(feature = "clnx")]
-        Command::Reconcile { config } => match cwld::linux::reconcile_instances(&config) {
+        Command::Reconcile {
+            config,
+            dry_run,
+            print,
+        } => match cwld::linux::reconcile_instances(&config, dry_run, print) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
                 eprintln!("cwld: {message}");

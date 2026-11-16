@@ -53,7 +53,7 @@ fn fake(state: Option<InstanceState>) -> Fake {
 }
 
 fn run(f: &Fake, dir: &std::path::Path) -> Outcome {
-    reconcile(f, &[spec("mac")], dir).remove(0).1
+    reconcile(f, &[spec("mac")], dir, true).remove(0).1
 }
 
 #[test]
@@ -96,6 +96,20 @@ fn a_live_domain_is_never_touched() {
         assert_eq!(run(&f, &dir), Outcome::Pending);
         assert!(f.defines.borrow().is_empty());
     }
+}
+
+#[test]
+fn a_dry_run_reports_and_changes_nothing() {
+    let dir = tempdir("dry");
+    let f = fake(Some(InstanceState::Stopped));
+    let out = reconcile(&f, &[spec("mac")], &dir, false).remove(0).1;
+    assert_eq!(out, Outcome::Redefined);
+    assert!(f.defines.borrow().is_empty());
+    assert_eq!(
+        run(&f, &dir),
+        Outcome::Redefined,
+        "nothing was recorded by the dry run"
+    );
 }
 
 #[test]

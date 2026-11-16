@@ -82,19 +82,31 @@ fn is_shut_off(state: &InstanceState) -> bool {
     matches!(state, InstanceState::Defined | InstanceState::Stopped)
 }
 
-/// Reconcile every spec; one outcome per instance, in order.
+/// Reconcile every spec; one outcome per instance, in order. With `apply` false nothing is defined
+/// or recorded: the outcomes say what a run would do (`Defined`/`Redefined`/`Pending`).
 pub fn reconcile<D: Domains>(
     domains: &D,
     specs: &[InstanceSpec],
     state_dir: &Path,
+    apply: bool,
 ) -> Vec<(InstanceId, Outcome)> {
     specs
         .iter()
-        .map(|spec| (spec.id.clone(), reconcile_one(domains, spec, state_dir)))
+        .map(|spec| {
+            (
+                spec.id.clone(),
+                reconcile_one(domains, spec, state_dir, apply),
+            )
+        })
         .collect()
 }
 
-fn reconcile_one<D: Domains>(domains: &D, spec: &InstanceSpec, state_dir: &Path) -> Outcome {
+fn reconcile_one<D: Domains>(
+    domains: &D,
+    spec: &InstanceSpec,
+    state_dir: &Path,
+    apply: bool,
+) -> Outcome {
     let rendered = match domains.render(spec) {
         Ok(xml) => xml,
         Err(why) => return Outcome::Failed(why),
@@ -112,6 +124,9 @@ fn reconcile_one<D: Domains>(domains: &D, spec: &InstanceSpec, state_dir: &Path)
         Some(s) if is_shut_off(s) => Outcome::Redefined,
         Some(_) => return Outcome::Pending,
     };
+    if !apply {
+        return outcome;
+    }
     if let Err(why) = domains.define(spec) {
         return Outcome::Failed(why);
     }
