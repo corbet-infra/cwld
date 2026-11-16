@@ -723,9 +723,14 @@ struct HostDomains {
 
 impl crate::reconcile::Domains for HostDomains {
     fn render(&self, spec: &InstanceSpec) -> Result<String, String> {
-        self.instances
+        let xml = self
+            .instances
             .render(spec)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if self.print {
+            println!("<!-- rendered {} -->\n{xml}", spec.id);
+        }
+        Ok(xml)
     }
 
     fn state(&self, id: &cdrv::InstanceId) -> Result<Option<cdrv::InstanceState>, String> {
