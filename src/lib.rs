@@ -49,6 +49,7 @@ pub mod lifecycle;
 pub mod linux;
 pub mod plan;
 pub mod ports;
+pub mod reconcile;
 pub mod recovery;
 pub mod runtime;
 pub mod store;

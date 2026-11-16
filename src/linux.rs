@@ -60,6 +60,10 @@ pub struct HostConfig {
     /// The Argo CD namespace whose Applications own the GPU pods.
     #[serde(default = "default_argocd")]
     pub argocd_namespace: String,
+    /// Deployment data the instance specs do not carry (firmware, OpenCore image, CPU model...);
+    /// the defaults of `RenderOptions` when absent.
+    #[serde(default)]
+    pub render: Option<RenderConfig>,
     /// The instances this host runs.
     #[serde(default)]
     pub instances: Vec<InstanceEntry>,
@@ -92,6 +96,73 @@ pub struct GuardEntry {
     pub namespace: String,
     /// Its pods' label selector.
     pub labels: String,
+}
+
+/// The render options of this host (`RenderOptions`, as deployment data).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderConfig {
+    /// The QEMU machine type.
+    pub machine: Option<String>,
+    /// The emulator binary (absolute path).
+    pub emulator: Option<String>,
+    /// The pflash code file.
+    pub loader: Option<PathBuf>,
+    /// The NVRAM template.
+    pub nvram_template: Option<PathBuf>,
+    /// The per-domain NVRAM file.
+    pub nvram: Option<PathBuf>,
+    /// The OpenCore boot image of a macOS guest.
+    pub opencore_iso: Option<PathBuf>,
+    /// A file holding the AppleSMC OSK string (read at render time, never kept in the config).
+    pub apple_smc_osk_file: Option<PathBuf>,
+    /// A custom CPU model string.
+    pub cpu_model: Option<String>,
+    /// The 64-bit MMIO window in MiB.
+    pub mmio64_mib: Option<u64>,
+    /// The VNC socket for a spec that asks for a console.
+    pub console_socket: Option<PathBuf>,
+    /// Whether to keep an emulated display beside a passed-through card.
+    pub emulated_display: Option<bool>,
+    /// Extra MiB above the RAM claim for the domain's hard limit.
+    pub hard_limit_extra_mib: Option<u64>,
+}
+
+impl HostConfig {
+    /// The render options: the library defaults with this host's data on top.
+    ///
+    /// # Errors
+    ///
+    /// The OSK file cannot be read.
+    pub fn render_options(&self) -> Result<RenderOptions, String> {
+        let mut o = RenderOptions::default();
+        let Some(r) = &self.render else {
+            return Ok(o);
+        };
+        if let Some(v) = &r.machine {
+            o.machine.clone_from(v);
+        }
+        o.emulator = r.emulator.clone().or(o.emulator);
+        o.loader = r.loader.clone().or(o.loader);
+        o.nvram_template = r.nvram_template.clone().or(o.nvram_template);
+        o.nvram = r.nvram.clone().or(o.nvram);
+        o.opencore_iso = r.opencore_iso.clone().or(o.opencore_iso);
+        if let Some(file) = &r.apple_smc_osk_file {
+            let text = fs::read_to_string(file)
+                .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+            o.apple_smc_osk = Some(text.trim().to_owned());
+        }
+        o.cpu_model = r.cpu_model.clone().or(o.cpu_model);
+        if let Some(v) = r.mmio64_mib {
+            o.mmio64_mib = v;
+        }
+        o.console_socket = r.console_socket.clone().or(o.console_socket);
+        if let Some(v) = r.emulated_display {
+            o.emulated_display = v;
+        }
+        o.hard_limit_extra_mib = r.hard_limit_extra_mib.or(o.hard_limit_extra_mib);
+        Ok(o)
+    }
 }
 
 /// The model broker as a Kubernetes Service.
@@ -294,7 +365,7 @@ fn execute(
 ) -> Result<PlanReport, String> {
     let (name, functions) = Inventory::load(&config.inventory)?;
     let libvirt = RealLibvirt::connect(&config.libvirt_uri).map_err(|error| error.to_string())?;
-    let mut instances = LinuxInstances::new(config.host.clone(), libvirt, RenderOptions::default());
+    let mut instances = LinuxInstances::new(config.host.clone(), libvirt, config.render_options()?);
     for entry in &config.instances {
         if let Some(argv) = &entry.clean_stop {
             instances = instances.with_clean_stop(entry.spec.id.as_str(), argv.clone());
@@ -641,5 +712,89 @@ mod tests {
         fs::write(&file, r#"{"schema":1,"name":"example-gpu","functions":[]}"#).unwrap();
         assert!(Inventory::load(&file).is_err());
         fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// The host side of the instance reconcile: clnx renders, libvirt defines.
+struct HostDomains {
+    instances: LinuxInstances<RealLibvirt, clnx::ProcessRunner>,
+}
+
+impl crate::reconcile::Domains for HostDomains {
+    fn render(&self, spec: &InstanceSpec) -> Result<String, String> {
+        self.instances
+            .render(spec)
+            .map_err(|error| error.to_string())
+    }
+
+    fn state(&self, id: &cdrv::InstanceId) -> Result<Option<cdrv::InstanceState>, String> {
+        use cdrv::traits::HostInstances;
+        let known = self.instances.list().map_err(|error| error.to_string())?;
+        Ok(known
+            .into_iter()
+            .find(|(name, _)| name == id)
+            .map(|(_, state)| state))
+    }
+
+    fn define(&self, spec: &InstanceSpec) -> Result<(), String> {
+        use cdrv::traits::HostInstances;
+        self.instances
+            .define(spec)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// `cwld reconcile`: define every declared instance whose domain is missing or shut off with a
+/// different render; a live domain is reported `pending` and not touched. Prints one line each.
+///
+/// # Errors
+///
+/// The host file or libvirt cannot be used, or an instance could not be reconciled.
+pub fn reconcile_instances(path: &Path) -> Result<(), String> {
+    let config = HostConfig::load(path)?;
+    let libvirt = RealLibvirt::connect(&config.libvirt_uri).map_err(|error| error.to_string())?;
+    let instances = LinuxInstances::new(config.host.clone(), libvirt, config.render_options()?);
+    let specs: Vec<InstanceSpec> = config.instances.iter().map(|e| e.spec.clone()).collect();
+    let mut failed = 0;
+    for (id, outcome) in
+        crate::reconcile::reconcile(&HostDomains { instances }, &specs, &config.state_dir)
+    {
+        println!("{id}: {}", outcome.describe());
+        if matches!(outcome, crate::reconcile::Outcome::Failed(_)) {
+            failed += 1;
+        }
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(format!("{failed} instance(s) could not be reconciled"))
+    }
+}
+
+#[cfg(test)]
+mod render_config_tests {
+    use super::HostConfig;
+
+    #[test]
+    fn the_render_section_overrides_the_defaults_and_the_osk_comes_from_a_file() {
+        let dir = std::env::temp_dir().join(format!("cwld-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        std::fs::write(dir.join("osk"), "synthetic-osk\n").expect("an osk file");
+        let text = format!(
+            r#"{{"host":"h","conductor":"/c","state_dir":"/s","inventory":"/i","host_driver":"amdgpu",
+               "desktop":{{"unit":"u"}},
+               "render":{{"opencore_iso":"/oc.iso","apple_smc_osk_file":"{}/osk","mmio64_mib":1024,"cpu_model":"m"}}}}"#,
+            dir.display()
+        );
+        let config: HostConfig = serde_json::from_str(&text).expect("a host file");
+        let o = config.render_options().expect("options");
+        assert_eq!(o.apple_smc_osk.as_deref(), Some("synthetic-osk"));
+        assert_eq!(o.mmio64_mib, 1024);
+        assert_eq!(o.cpu_model.as_deref(), Some("m"));
+        assert_eq!(
+            o.machine, "pc-q35-11.1",
+            "unset fields keep the library default"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

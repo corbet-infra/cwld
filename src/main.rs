@@ -48,6 +48,15 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Make the defined domains follow the declared instances: define a missing domain, redefine a
+    /// shut-off one whose render changed, report a live one as pending and leave it. Run it when the
+    /// configuration changes; it does nothing else.
+    #[cfg(feature = "clnx")]
+    Reconcile {
+        /// The host file (JSON).
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -78,6 +87,14 @@ fn main() -> ExitCode {
         Command::RunPlan { plan, dry_run } => run_plan(&plan, dry_run),
         #[cfg(feature = "clnx")]
         Command::Follow { config } => match cwld::linux::follow(&config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("cwld: {message}");
+                ExitCode::FAILURE
+            }
+        },
+        #[cfg(feature = "clnx")]
+        Command::Reconcile { config } => match cwld::linux::reconcile_instances(&config) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
                 eprintln!("cwld: {message}");
