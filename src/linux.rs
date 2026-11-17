@@ -994,7 +994,10 @@ pub fn reconcile_instances(path: &Path, dry_run: bool, print: bool) -> Result<()
         !dry_run,
     ) {
         println!("{id}: {}", outcome.describe());
-        if matches!(outcome, crate::reconcile::Outcome::Failed(_)) {
+        if let crate::reconcile::Outcome::Failed(reason) = &outcome {
+            // the unit's ExecStart ignores the exit status (a switch must not fail on it), so a
+            // refusal is made explicit and greppable in the journal
+            eprintln!("cwld-reconcile: REFUSED {id}: {reason}");
             failed += 1;
         }
     }
