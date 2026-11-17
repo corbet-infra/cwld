@@ -39,6 +39,9 @@ use clnx::{KubeClient, LinuxSysfs};
 pub struct Counters {
     starved: BTreeMap<String, u32>,
     card: Option<CardSample>,
+    /// The sampler's spill count at the last shed: a spill that goes on after
+    /// a shed must earn its grace again (the watcher reset all its counters).
+    spill_base: u32,
 }
 
 impl Counters {
@@ -53,9 +56,21 @@ impl Counters {
         }
     }
 
+    /// After a shed every starvation signal earns its grace again, as the
+    /// watcher reset its counters after a kill: the freed VRAM lands during
+    /// the cooldown, and only a starvation that outlasts it sheds the next
+    /// tenant.
+    pub fn regrace(&mut self) {
+        self.starved.clear();
+        self.spill_base = self.card.map_or(0, |sample| sample.spilling);
+    }
+
     /// Take what woke the observer: a card reading replaces the previous one.
     pub fn wake(&mut self, wake: Wake) {
         if let Wake::Card(sample) = wake {
+            if sample.spilling == 0 {
+                self.spill_base = 0;
+            }
             self.card = Some(sample);
         }
     }
@@ -116,12 +131,13 @@ impl Counters {
                 starved_ticks: ticks,
             });
         }
-        // The desktop's GTT spill: the sampler's latest reading, its own count.
-        if let Some(sample) = self.card.filter(|sample| sample.spilling > 0) {
+        // The desktop's GTT spill: the sampler's latest reading, its own count,
+        // counted from the last shed.
+        if let Some(sample) = self.card.filter(|sample| sample.spilling > self.spill_base) {
             signals.push(StarvationSignal::DesktopGttSpill {
                 gtt_used_bytes: sample.memory.gtt_used,
                 gtt_previous_bytes: sample.gtt_previous,
-                starved_ticks: sample.spilling,
+                starved_ticks: sample.spilling - self.spill_base,
             });
         }
         PressureObservation {
@@ -203,6 +219,12 @@ fn observe_loop(
         match connected.pressure(&observation) {
             Ok(answer) => {
                 report(&answer);
+                if matches!(
+                    answer.ladder,
+                    LadderDecision::ScaleLowestPriorityToZero { .. }
+                ) {
+                    counters.regrace();
+                }
                 deadline = answer
                     .wake_at
                     .map(|at| Instant::now() + until(at, now_millis()));
@@ -396,6 +418,70 @@ mod tests {
                 used_bytes: 15 * GIB,
                 total_bytes: 16 * GIB,
             })
+        );
+    }
+
+    #[test]
+    fn after_a_shed_every_signal_earns_its_grace_again() {
+        let mut counters = Counters::default();
+        let _ = counters.observation(&facts(0, 1, 0));
+        counters.wake(spill(3, 2, 2));
+        let before = counters.observation(&facts(0, 1, 0));
+        assert!(before.signals.iter().any(|signal| matches!(
+            signal,
+            StarvationSignal::PodNotReady {
+                starved_ticks: 2,
+                ..
+            }
+        )));
+        assert!(before.signals.iter().any(|signal| matches!(
+            signal,
+            StarvationSignal::DesktopGttSpill {
+                starved_ticks: 2,
+                ..
+            }
+        )));
+
+        counters.regrace();
+        assert!(
+            counters.observation(&facts(1, 1, 0)).signals.is_empty(),
+            "right after the shed the running spill counts nothing yet"
+        );
+        counters.wake(spill(4, 3, 3));
+        let again = counters.observation(&facts(0, 1, 0));
+        assert!(again.signals.iter().any(|signal| matches!(
+            signal,
+            StarvationSignal::PodNotReady {
+                starved_ticks: 1,
+                ..
+            }
+        )));
+        assert!(
+            again.signals.iter().any(|signal| matches!(
+                signal,
+                StarvationSignal::DesktopGttSpill {
+                    starved_ticks: 1,
+                    ..
+                }
+            )),
+            "one more spilling reading after the shed: {:?}",
+            again.signals
+        );
+        counters.wake(spill(4, 4, 0));
+        counters.wake(spill(5, 4, 1));
+        assert!(
+            counters
+                .observation(&facts(1, 1, 0))
+                .signals
+                .iter()
+                .any(|signal| matches!(
+                    signal,
+                    StarvationSignal::DesktopGttSpill {
+                        starved_ticks: 1,
+                        ..
+                    }
+                )),
+            "a new spill after the old one ended counts from 1 again"
         );
     }
 
