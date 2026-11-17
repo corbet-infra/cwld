@@ -153,7 +153,7 @@ dependencies = [
 [[package]]
 name = "cdct"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-infra/cdct.git?branch=main#26af7ed588fb5c55d3d44c6fc75371cafed76e62"
+source = "git+https://git.corbet.ch/corbet-infra/cdct.git?branch=main#e6691e5001f5b9f3eef6551ee2c772ba644a1b9c"
 dependencies = [
  "cdrv",
  "clap",

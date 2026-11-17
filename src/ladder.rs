@@ -14,16 +14,22 @@
 //! pressure-watcher's 6 s), counts the consecutive spilling readings itself and
 //! wakes the observer while the full card spills; the latest reading is the
 //! spill signal of every observation.
+//!
+//! The conductor may also ask for the next observation at a deadline (the end
+//! of a cooldown while a shed tenant waits for its restore): the observer then
+//! observes at that instant even when no event comes. A deadline, not a poll.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cdct::{
-    Client, Endpoint, GpuTenant, LadderDecision, PressureObservation, RestoreDecision,
-    StarvationSignal, TenantState, VramFacts,
+    Client, Endpoint, GpuTenant, LadderDecision, PressureAnswer, PressureObservation,
+    RestoreDecision, StarvationSignal, TenantState, VramFacts,
 };
+use cdrv::Timestamp;
 use clnx::pressure::{CardSample, PressureConfig, PressureFacts, Wake};
 use clnx::{KubeClient, LinuxSysfs};
 
@@ -157,9 +163,25 @@ fn observe_loop(
     let sysfs = LinuxSysfs::system();
     let mut counters = Counters::default();
     let mut client: Option<Client> = None;
-    while let Ok(wake) = receiver.recv() {
+    let mut deadline: Option<Instant> = None;
+    loop {
+        // An event, or the conductor's deadline: either one is an observation.
+        let wake = match deadline {
+            Some(at) => match receiver.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(wake) => Some(wake),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            },
+            None => match receiver.recv() {
+                Ok(wake) => Some(wake),
+                Err(_) => return,
+            },
+        };
+        deadline = None;
         // One observation per burst: every wake-up already queued is covered by it.
-        counters.wake(wake);
+        if let Some(wake) = wake {
+            counters.wake(wake);
+        }
         while let Ok(wake) = receiver.try_recv() {
             counters.wake(wake);
         }
@@ -179,8 +201,11 @@ fn observe_loop(
             continue;
         };
         match connected.pressure(&observation) {
-            Ok((ladder, restore, restart_plugin)) => {
-                report(&ladder, restore.as_ref(), restart_plugin);
+            Ok(answer) => {
+                report(&answer);
+                deadline = answer
+                    .wake_at
+                    .map(|at| Instant::now() + until(at, now_millis()));
             }
             Err(error) => {
                 eprintln!("cwld ladder: the conductor did not take the observation: {error}");
@@ -190,7 +215,34 @@ fn observe_loop(
     }
 }
 
-fn report(ladder: &LadderDecision, restore: Option<&RestoreDecision>, restart_plugin: bool) {
+/// The wait until the conductor's deadline `at` from `now` (both in
+/// milliseconds since the epoch), a little past it so the conductor's
+/// `now < deadline` test has turned; a deadline already gone is at once.
+fn until(at: Timestamp, now: u64) -> Duration {
+    Duration::from_millis(
+        at.as_millis()
+            .saturating_sub(now)
+            .saturating_add(DEADLINE_SLACK_MS),
+    )
+}
+
+/// How far past the conductor's deadline the observer looks again.
+const DEADLINE_SLACK_MS: u64 = 100;
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn report(answer: &PressureAnswer) {
+    let (ladder, restore, restart_plugin) = (
+        &answer.ladder,
+        answer.restore.as_ref(),
+        answer.restart_plugin,
+    );
     if restart_plugin {
         println!("cwld ladder: the conductor restarts the GPU device plugin (lost registration)");
     }
@@ -202,6 +254,24 @@ fn report(ladder: &LadderDecision, restore: Option<&RestoreDecision>, restart_pl
     }) = restore
     {
         println!("cwld ladder: the conductor restores {tenant} with {replicas} replica(s)");
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn the_wait_ends_just_past_the_conductors_deadline() {
+        assert_eq!(
+            until(Timestamp::from_millis(10_000), 4_000),
+            Duration::from_millis(6_000 + DEADLINE_SLACK_MS)
+        );
+        assert_eq!(
+            until(Timestamp::from_millis(4_000), 10_000),
+            Duration::from_millis(DEADLINE_SLACK_MS),
+            "a deadline already gone is observed at once"
+        );
     }
 }
 
