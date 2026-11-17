@@ -693,7 +693,11 @@ pub fn follow(path: &Path) -> Result<(), String> {
             Input::Conductor(Err(error)) => {
                 return Err(format!("the conductor stream failed: {error}"));
             }
-            Input::Shutdown { domain, reset } => stops.shutdown(&domain, reset),
+            Input::Shutdown {
+                domain,
+                reset,
+                guest,
+            } => stops.shutdown(&domain, reset, guest),
             Input::Stopped(domain) => {
                 let owner = conductor_owner(&config.conductor);
                 let owns = owner
@@ -711,8 +715,9 @@ pub fn follow(path: &Path) -> Result<(), String> {
                             Ok(Input::Shutdown {
                                 domain: about,
                                 reset,
+                                guest,
                             }) if about == domain => {
-                                stops.shutdown(&about, reset);
+                                stops.shutdown(&about, reset, guest);
                                 break;
                             }
                             Ok(other) => pending.push_back(other),
@@ -771,8 +776,13 @@ enum Input {
     Conductor(Result<Option<Reply>, String>),
     /// A configured guest's domain stopped.
     Stopped(String),
-    /// QEMU's shutdown reason for a domain (`reset`: a reboot from inside).
-    Shutdown { domain: String, reset: bool },
+    /// QEMU's shutdown reason for a domain (`reset`: a reboot from inside;
+    /// `guest`: the guest asked for it, not the host).
+    Shutdown {
+        domain: String,
+        reset: bool,
+        guest: bool,
+    },
 }
 
 /// The card's owner as the conductor names it now; `None` when it cannot be asked.
@@ -819,6 +829,7 @@ fn watch_guests(uri: &str, guests: &[String], sender: &mpsc::Sender<Input>) -> R
                         .send(Input::Shutdown {
                             domain: event.domain,
                             reset: event.reset,
+                            guest: event.guest,
                         })
                         .is_err()
                 {

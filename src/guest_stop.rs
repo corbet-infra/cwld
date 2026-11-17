@@ -50,9 +50,18 @@ impl GuestStops {
     }
 
     /// Record QEMU's shutdown reason for a domain: a reset is a reboot from
-    /// inside, anything else is not.
-    pub fn shutdown(&mut self, domain: &str, reset: bool) {
-        self.reasons.insert(domain.to_owned(), reset);
+    /// inside, anything else is not. `guest` says whether the guest asked for
+    /// it. With `on_reboot=destroy` QEMU reports a guest's reboot twice: the
+    /// guest's `guest-reset`, then, as libvirt ends the process, a host-side
+    /// `host-signal` (attempt 4, 2026-11-17: the second one overwrote the
+    /// first and the reboot returned the card). A host-side reason therefore
+    /// never replaces a reason the guest gave; alone it still counts (not a
+    /// reboot: when unsure, the card returns).
+    pub fn shutdown(&mut self, domain: &str, reset: bool, guest: bool) {
+        if !guest && self.reasons.contains_key(domain) {
+            return;
+        }
+        self.reasons.insert(domain.to_owned(), reset && guest);
     }
 
     /// Whether QEMU's reason for this domain's stop is known yet. The reason
@@ -104,7 +113,7 @@ mod tests {
     #[test]
     fn a_reboot_from_inside_restarts_the_guest_and_keeps_the_card() {
         let mut stops = GuestStops::default();
-        stops.shutdown("mac", true);
+        stops.shutdown("mac", true, true);
         assert_eq!(stops.stopped("mac", true), GuestStopReaction::Restart);
         // The reboot is consumed: the next stop is judged afresh.
         assert_eq!(stops.stopped("mac", true), GuestStopReaction::ReturnToHost);
@@ -113,7 +122,7 @@ mod tests {
     #[test]
     fn a_shutdown_from_inside_returns_the_card() {
         let mut stops = GuestStops::default();
-        stops.shutdown("mac", false);
+        stops.shutdown("mac", false, true);
         assert_eq!(stops.stopped("mac", true), GuestStopReaction::ReturnToHost);
         // With no reason seen at all the card returns too.
         assert_eq!(stops.stopped("win", true), GuestStopReaction::ReturnToHost);
@@ -123,18 +132,18 @@ mod tests {
     fn a_stop_a_plan_made_is_left_to_the_plan() {
         let mut stops = GuestStops::default();
         stops.plan_stopped(&[stop_step("mac")]);
-        stops.shutdown("mac", false);
+        stops.shutdown("mac", false, true);
         assert_eq!(stops.stopped("mac", true), GuestStopReaction::Ignore);
         // Even a reboot reason does not override a planned stop.
         stops.plan_stopped(&[stop_step("mac")]);
-        stops.shutdown("mac", true);
+        stops.shutdown("mac", true, true);
         assert_eq!(stops.stopped("mac", true), GuestStopReaction::Ignore);
     }
 
     #[test]
     fn a_guest_that_holds_no_card_is_left_alone() {
         let mut stops = GuestStops::default();
-        stops.shutdown("dev", true);
+        stops.shutdown("dev", true, true);
         assert_eq!(stops.stopped("dev", false), GuestStopReaction::Ignore);
     }
 
@@ -142,17 +151,34 @@ mod tests {
     fn the_reason_is_known_until_the_stop_consumes_it() {
         let mut stops = GuestStops::default();
         assert!(!stops.knows_reason("mac"));
-        stops.shutdown("mac", true);
+        stops.shutdown("mac", true, true);
         assert!(stops.knows_reason("mac"));
         let _ = stops.stopped("mac", true);
         assert!(!stops.knows_reason("mac"));
     }
 
     #[test]
+    fn libvirts_own_kill_after_a_guest_reset_keeps_the_reboot() {
+        // The two SHUTDOWN events QEMU sends for a reboot with on_reboot=destroy,
+        // in the order a live probe on srv received them (2026-11-17).
+        let mut stops = GuestStops::default();
+        stops.shutdown("mac", true, true); // {"guest":true,"reason":"guest-reset"}
+        stops.shutdown("mac", false, false); // {"guest":false,"reason":"host-signal"}
+        assert_eq!(stops.stopped("mac", true), GuestStopReaction::Restart);
+    }
+
+    #[test]
+    fn a_host_side_stop_alone_is_no_reboot() {
+        let mut stops = GuestStops::default();
+        stops.shutdown("mac", false, false);
+        assert_eq!(stops.stopped("mac", true), GuestStopReaction::ReturnToHost);
+    }
+
+    #[test]
     fn a_later_power_off_reason_clears_an_earlier_reset() {
         let mut stops = GuestStops::default();
-        stops.shutdown("mac", true);
-        stops.shutdown("mac", false);
+        stops.shutdown("mac", true, true);
+        stops.shutdown("mac", false, true);
         assert_eq!(stops.stopped("mac", true), GuestStopReaction::ReturnToHost);
     }
 }
