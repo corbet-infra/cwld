@@ -86,6 +86,21 @@ pub struct LadderConfig {
     /// The GPU device plugin's registration guard.
     #[serde(default)]
     pub guard: Option<GuardEntry>,
+    /// The card sampler: the desktop's GTT spill, read on a clock.
+    #[serde(default)]
+    pub sampler: Option<SamplerEntry>,
+}
+
+/// The card sampler's clock and thresholds (the conductor's policy values).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplerEntry {
+    /// Seconds between two readings (at least 1).
+    pub interval_secs: u64,
+    /// GTT growth between two readings below which a spill is noise, in bytes.
+    pub gtt_delta_bytes: u64,
+    /// The VRAM-used fraction above which the card counts as full.
+    pub vram_full_fraction: f64,
 }
 
 /// The device plugin and the resources it must advertise while it runs.
@@ -561,6 +576,20 @@ pub fn follow(path: &Path) -> Result<(), String> {
             }
             None => None,
         };
+        let sampler = match ladder.sampler {
+            Some(entry) if entry.interval_secs == 0 => {
+                return Err(format!(
+                    "{}: ladder.sampler.interval_secs must be at least 1",
+                    path.display()
+                ));
+            }
+            Some(entry) => Some(clnx::pressure::SamplerConfig {
+                interval: Duration::from_secs(entry.interval_secs),
+                gtt_delta_bytes: entry.gtt_delta_bytes,
+                vram_full_fraction: entry.vram_full_fraction,
+            }),
+            None => None,
+        };
         crate::ladder::start(
             clnx::pressure::PressureConfig {
                 node: ladder.node.clone(),
@@ -574,6 +603,7 @@ pub fn follow(path: &Path) -> Result<(), String> {
                         namespace: guard.namespace.clone(),
                         labels: guard.labels.clone(),
                     }),
+                sampler,
             },
             config.conductor.clone(),
         )?;
@@ -842,11 +872,17 @@ mod tests {
                 "ladder":{"node":"example-node",
                   "broker":{"service":"llm/example-broker","port":8080},
                   "guard":{"resources":["example.com/slot"],"namespace":"kube-system",
-                    "labels":"app=example-plugin"}}}"#,
+                    "labels":"app=example-plugin"},
+                  "sampler":{"interval_secs":6,"gtt_delta_bytes":67108864,
+                    "vram_full_fraction":0.85}}}"#,
         )
         .unwrap();
         assert_eq!(config.instances[0].bar_limits[0].mib, 1024);
         let ladder = config.ladder.unwrap();
+        let sampler = ladder.sampler.unwrap();
+        assert_eq!(sampler.interval_secs, 6);
+        assert_eq!(sampler.gtt_delta_bytes, 64 * 1024 * 1024);
+        assert!((sampler.vram_full_fraction - 0.85).abs() < f64::EPSILON);
         assert_eq!(ladder.broker.unwrap().port, 8080);
         assert_eq!(
             ladder.guard.unwrap().resources,

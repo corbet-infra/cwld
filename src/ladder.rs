@@ -9,8 +9,11 @@
 //! executed there like any switch. Nothing here runs on a timer.
 //!
 //! Grace is counted in observations: a starvation signal carries how many
-//! consecutive observations it has lasted. The desktop's GTT spill has no
-//! event source of its own; it is judged only at the events above.
+//! consecutive observations it has lasted. The desktop's GTT spill is the
+//! exception: clnx's card sampler reads the counters on a clock (the retired
+//! pressure-watcher's 6 s), counts the consecutive spilling readings itself and
+//! wakes the observer while the full card spills; the latest reading is the
+//! spill signal of every observation.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,14 +24,15 @@ use cdct::{
     Client, Endpoint, GpuTenant, LadderDecision, PressureObservation, RestoreDecision,
     StarvationSignal, TenantState, VramFacts,
 };
-use clnx::pressure::{PressureConfig, PressureFacts, Wake};
+use clnx::pressure::{CardSample, PressureConfig, PressureFacts, Wake};
 use clnx::{KubeClient, LinuxSysfs};
 
-/// Consecutive-observation counters, one per signal.
+/// Consecutive-observation counters, one per signal, and the card sampler's
+/// latest reading.
 #[derive(Debug, Default)]
 pub struct Counters {
     starved: BTreeMap<String, u32>,
-    gtt_previous: Option<u64>,
+    card: Option<CardSample>,
 }
 
 impl Counters {
@@ -43,10 +47,17 @@ impl Counters {
         }
     }
 
+    /// Take what woke the observer: a card reading replaces the previous one.
+    pub fn wake(&mut self, wake: Wake) {
+        if let Wake::Card(sample) = wake {
+            self.card = Some(sample);
+        }
+    }
+
     /// Turn one set of facts into the conductor's observation, advancing the
     /// counters. A tenant asking for replicas it does not have ready is
-    /// starved; the broker's stuck models and a rising GTT are the other two
-    /// signals.
+    /// starved; the broker's stuck models and the card sampler's spill are the
+    /// other two signals.
     pub fn observation(&mut self, facts: &PressureFacts) -> PressureObservation {
         let mut tenants = Vec::new();
         let mut signals = Vec::new();
@@ -99,20 +110,13 @@ impl Counters {
                 starved_ticks: ticks,
             });
         }
-        if let Some(memory) = facts.memory {
-            let previous = self.gtt_previous.replace(memory.gtt_used);
-            let rising = previous.is_some_and(|previous| memory.gtt_used > previous);
-            let ticks = self.bump("gtt", rising);
-            if let (true, Some(previous)) = (ticks > 0, previous) {
-                signals.push(StarvationSignal::DesktopGttSpill {
-                    gtt_used_bytes: memory.gtt_used,
-                    gtt_previous_bytes: previous,
-                    starved_ticks: ticks,
-                });
-            }
-        } else {
-            self.gtt_previous = None;
-            self.bump("gtt", false);
+        // The desktop's GTT spill: the sampler's latest reading, its own count.
+        if let Some(sample) = self.card.filter(|sample| sample.spilling > 0) {
+            signals.push(StarvationSignal::DesktopGttSpill {
+                gtt_used_bytes: sample.memory.gtt_used,
+                gtt_previous_bytes: sample.gtt_previous,
+                starved_ticks: sample.spilling,
+            });
         }
         PressureObservation {
             vram: facts.memory.map(|memory| VramFacts {
@@ -153,9 +157,12 @@ fn observe_loop(
     let sysfs = LinuxSysfs::system();
     let mut counters = Counters::default();
     let mut client: Option<Client> = None;
-    while receiver.recv().is_ok() {
+    while let Ok(wake) = receiver.recv() {
         // One observation per burst: every wake-up already queued is covered by it.
-        while receiver.try_recv().is_ok() {}
+        counters.wake(wake);
+        while let Ok(wake) = receiver.try_recv() {
+            counters.wake(wake);
+        }
         let facts = match clnx::pressure::observe(config, &sysfs, kube) {
             Ok(facts) => facts,
             Err(error) => {
@@ -267,10 +274,24 @@ mod tests {
         ));
     }
 
+    fn spill(gtt_gib: u64, previous_gib: u64, spilling: u32) -> Wake {
+        Wake::Card(CardSample {
+            memory: CardMemory {
+                vram_used: 15 * GIB,
+                vram_total: 16 * GIB,
+                gtt_used: gtt_gib * GIB,
+            },
+            gtt_previous: previous_gib * GIB,
+            spilling,
+        })
+    }
+
     #[test]
-    fn a_rising_gtt_and_stuck_broker_models_are_signals() {
+    fn the_samplers_spill_and_stuck_broker_models_are_signals() {
         let mut counters = Counters::default();
-        let _ = counters.observation(&facts(1, 1, 0));
+        let quiet = counters.observation(&facts(1, 1, 0));
+        assert!(quiet.signals.is_empty(), "no reading, no spill");
+        counters.wake(spill(3, 1, 1));
         let rising = counters.observation(&facts(1, 3, 2));
         assert!(
             rising
@@ -285,14 +306,69 @@ mod tests {
             gtt_previous_bytes: GIB,
             starved_ticks: 1,
         }));
-        let flat = counters.observation(&facts(1, 3, 0));
-        assert!(flat.signals.is_empty());
+        counters.wake(Wake::Kubernetes);
+        let still = counters.observation(&facts(1, 3, 0));
         assert_eq!(
-            flat.vram,
+            still.signals,
+            vec![StarvationSignal::DesktopGttSpill {
+                gtt_used_bytes: 3 * GIB,
+                gtt_previous_bytes: GIB,
+                starved_ticks: 1,
+            }],
+            "another wake-up keeps the sampler's latest reading"
+        );
+        counters.wake(spill(3, 3, 0));
+        let ended = counters.observation(&facts(1, 3, 0));
+        assert!(ended.signals.is_empty(), "the sampler ended the spill");
+        assert_eq!(
+            ended.vram,
             Some(VramFacts {
                 used_bytes: 15 * GIB,
                 total_bytes: 16 * GIB,
             })
+        );
+    }
+
+    #[test]
+    fn a_spill_over_two_readings_sheds_the_lowest_tenant_through_the_conductors_ladder() {
+        let mut counters = Counters::default();
+        let running = |counters: &mut Counters| {
+            let mut facts = facts(1, 2, 0);
+            facts.tenants[1].replicas = 1;
+            facts.tenants[1].ready = 1;
+            counters.observation(&facts)
+        };
+        let decide = |observation: &PressureObservation| {
+            cdct::gpu::decide_ladder(
+                &cdct::gpu::LadderInput {
+                    owner: cdrv::KernelOwner::Host,
+                    vram_full: true,
+                    now: cdrv::Timestamp::from_millis(10_000),
+                    cooldown_until: cdrv::Timestamp::from_millis(0),
+                    tenants: observation.tenants.clone(),
+                    signals: observation.signals.clone(),
+                },
+                &cdct::policy::GpuPolicy::default(),
+            )
+        };
+        counters.wake(spill(1, 0, 1));
+        assert!(
+            matches!(decide(&running(&mut counters)), LadderDecision::None { .. }),
+            "one spilling reading is inside the grace"
+        );
+        counters.wake(spill(2, 1, 2));
+        assert_eq!(
+            decide(&running(&mut counters)),
+            LadderDecision::ScaleLowestPriorityToZero {
+                tenant: "render/farm".to_owned(),
+                ladder: GpuLadder::BestEffort,
+                signal: StarvationSignal::DesktopGttSpill {
+                    gtt_used_bytes: 2 * GIB,
+                    gtt_previous_bytes: GIB,
+                    starved_ticks: 2,
+                },
+            },
+            "the desktop outranks every rung: the lowest running tenant leaves"
         );
     }
 }
